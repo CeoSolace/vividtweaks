@@ -320,7 +320,13 @@ async function createOrGetTicketChannel(guild, userId) {
 
 async function closeTicket(guild, channelId, userId, closerId) {
   const ch = await guild.channels.fetch(channelId).catch(() => null);
-  if (!ch || ch.type !== ChannelType.GuildText) return;
+  if (!ch || ch.type !== ChannelType.GuildText) {
+    await ticketsCol.updateOne(
+      { guildId: guild.id, channelId, userId, status: "open" },
+      { $set: { status: "closed", closedAt: new Date(), closedBy: closerId } }
+    );
+    return;
+  }
 
   const embed = new EmbedBuilder()
     .setColor(BRAND_COLOR)
@@ -874,8 +880,9 @@ client.on("interactionCreate", async (interaction) => {
         if (interaction.user.id !== ticket.userId && !isAdmin(interaction)) {
           return interaction.reply({ content: "Only the ticket owner or server admins can close this ticket.", ephemeral: true });
         }
+        await interaction.reply({ content: "Closing ticket...", ephemeral: true });
         await closeTicket(interaction.guild, interaction.channelId, ticket.userId, interaction.user.id);
-        return interaction.reply({ content: "Ticket closed.", ephemeral: true });
+        return;
       }
 
       if (interaction.customId.startsWith("tp:")) {
@@ -904,7 +911,7 @@ client.on("interactionCreate", async (interaction) => {
             `**Plan:** ${PLAN_LABELS[planKey]}\n` +
             `Please complete your payment using the secure link below.`
           )
-          .addFields({ name: "Checkout", value: "[Complete Payment on Stripe](<LINK>)".replace("<LINK>", url) })
+          .addFields({ name: "Checkout", value: `[Complete Payment on Stripe](${url})` })
           .setFooter({ text: BRAND_FOOTER })
           .setTimestamp(new Date());
         await interaction.channel.send({ embeds: [embed] });
@@ -1016,40 +1023,60 @@ client.on("ready", async () => {
 
 // ===================== WEB SERVER (Stripe Webhook) =====================
 const app = express();
-app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    console.error("❌ Webhook signature failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-  try {
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      const meta = session.metadata || {};
-      const purchaseId = meta.purchase_id;
-      const guildId = meta.guild_id;
-      const userId = meta.user_id;
-      const type = meta.type;
-      if (!purchaseId || !guildId || !userId || !type) return res.json({ received: true });
-      if (guildId !== ALLOWED_GUILD_ID) return res.json({ received: true });
 
-      const paymentIntentId = session.payment_intent || null;
-      const subscriptionId = session.subscription || null;
-      let currentPeriodEnd = null;
-      let subscriptionStatus = null;
-      let cancelAtPeriodEnd = null;
-      if (subscriptionId) {
-        const sub = await stripe.subscriptions.retrieve(subscriptionId);
-        currentPeriodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
-        subscriptionStatus = sub.status;
-        cancelAtPeriodEnd = !!sub.cancel_at_period_end;
-      }
+// Shared webhook handler logic
+async function handleStripeWebhook(event) {
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object;
+    const meta = session.metadata || {};
+    const purchaseId = meta.purchase_id;
+    const guildId = meta.guild_id;
+    const userId = meta.user_id;
+    const type = meta.type;
+    if (!purchaseId || !guildId || !userId || !type) return;
+    if (guildId !== ALLOWED_GUILD_ID) return;
 
-      const updated = await purchasesCol.findOneAndUpdate(
-        { purchaseId, stripeSessionId: session.id },
+    const paymentIntentId = session.payment_intent || null;
+    const subscriptionId = session.subscription || null;
+    let currentPeriodEnd = null;
+    let subscriptionStatus = null;
+    let cancelAtPeriodEnd = null;
+    if (subscriptionId) {
+      const sub = await stripe.subscriptions.retrieve(subscriptionId);
+      currentPeriodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+      subscriptionStatus = sub.status;
+      cancelAtPeriodEnd = !!sub.cancel_at_period_end;
+    }
+
+    const updated = await purchasesCol.findOneAndUpdate(
+      { purchaseId, stripeSessionId: session.id },
+      {
+        $set: {
+          status: "paid",
+          paidAt: new Date(),
+          stripePaymentIntentId: paymentIntentId,
+          stripeSubscriptionId: subscriptionId,
+          currentPeriodEnd,
+          subscriptionStatus,
+          cancelAtPeriodEnd,
+        },
+      },
+      { returnDocument: "after" }
+    );
+    if (!updated.value) {
+      await purchasesCol.updateOne(
+        { stripeSessionId: session.id },
         {
+          $setOnInsert: {
+            purchaseId,
+            guildId,
+            userId,
+            type,
+            amountMinor: Number(meta.amount_minor || 0) || 0,
+            currency: meta.currency || CURRENCY,
+            stripeSessionId: session.id,
+            createdAt: new Date(),
+          },
           $set: {
             status: "paid",
             paidAt: new Date(),
@@ -1060,122 +1087,125 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
             cancelAtPeriodEnd,
           },
         },
-        { returnDocument: "after" }
+        { upsert: true }
       );
-      if (!updated.value) {
-        await purchasesCol.updateOne(
-          { stripeSessionId: session.id },
-          {
-            $setOnInsert: {
-              purchaseId,
-              guildId,
-              userId,
-              type,
-              amountMinor: Number(meta.amount_minor || 0) || 0,
-              currency: meta.currency || CURRENCY,
-              stripeSessionId: session.id,
-              createdAt: new Date(),
-            },
-            $set: {
-              status: "paid",
-              paidAt: new Date(),
-              stripePaymentIntentId: paymentIntentId,
-              stripeSubscriptionId: subscriptionId,
-              currentPeriodEnd,
-              subscriptionStatus,
-              cancelAtPeriodEnd,
-            },
-          },
-          { upsert: true }
-        );
+    }
+
+    const guild = await client.guilds.fetch(guildId).catch(() => null);
+    if (!guild) return;
+
+    if (type === "product" && meta.role_id) {
+      try {
+        const member = await guild.members.fetch(userId);
+        await member.roles.add(meta.role_id, `Stripe paid: ${purchaseId}`);
+      } catch (e) {
+        console.error("Role grant failed:", e);
       }
+    }
 
-      const guild = await client.guilds.fetch(guildId).catch(() => null);
-      if (!guild) return res.json({ received: true });
+    const amountMinor = Number(meta.amount_minor || 0) || 0;
+    const planKey = meta.plan_key || null;
+    const logEmbed = new EmbedBuilder()
+      .setColor(BRAND_COLOR)
+      .setTitle(`${BRAND_NAME} • Purchase Completed`)
+      .addFields(
+        { name: "User", value: `<@${userId}>`, inline: true },
+        { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true },
+        { name: "Type", value: type, inline: true },
+        { name: "Amount", value: amountMinor ? minorToDisplay(amountMinor) : "n/a", inline: true },
+        ...(planKey ? [{ name: "Plan", value: PLAN_LABELS[planKey] || planKey, inline: true }] : []),
+        ...(meta.product_name ? [{ name: "Product", value: meta.product_name, inline: false }] : [])
+      )
+      .setFooter({ text: BRAND_FOOTER })
+      .setTimestamp(new Date());
+    await logToPurchaseLog(guild, logEmbed);
+    if (type === "product") {
+      await sendThanksIfConfigured(guild, userId, purchaseId);
+    }
+    return;
+  }
 
-      if (type === "product" && meta.role_id) {
+  if (event.type === "customer.subscription.updated") {
+    const sub = event.data.object;
+    await purchasesCol.updateMany(
+      { stripeSubscriptionId: sub.id, status: "paid" },
+      {
+        $set: {
+          subscriptionStatus: sub.status,
+          cancelAtPeriodEnd: !!sub.cancel_at_period_end,
+          currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
+          subscriptionUpdatedAt: new Date(),
+        },
+      }
+    );
+    return;
+  }
+
+  if (event.type === "customer.subscription.deleted") {
+    const sub = event.data.object;
+    const purchase = await purchasesCol.findOne(
+      { stripeSubscriptionId: sub.id, status: "paid", type: "product" },
+      { sort: { paidAt: -1 } }
+    );
+    if (purchase) {
+      const guild = await client.guilds.fetch(purchase.guildId).catch(() => null);
+      if (guild) {
         try {
-          const member = await guild.members.fetch(userId);
-          await member.roles.add(meta.role_id, `Stripe paid: ${purchaseId}`);
-        } catch (e) {
-          console.error("Role grant failed:", e);
-        }
-      }
-
-      const amountMinor = Number(meta.amount_minor || 0) || 0;
-      const planKey = meta.plan_key || null;
-      const logEmbed = new EmbedBuilder()
-        .setColor(BRAND_COLOR)
-        .setTitle(`${BRAND_NAME} • Purchase Completed`)
-        .addFields(
-          { name: "User", value: `<@${userId}>`, inline: true },
-          { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true },
-          { name: "Type", value: type, inline: true },
-          { name: "Amount", value: amountMinor ? minorToDisplay(amountMinor) : "n/a", inline: true },
-          ...(planKey ? [{ name: "Plan", value: PLAN_LABELS[planKey] || planKey, inline: true }] : []),
-          ...(meta.product_name ? [{ name: "Product", value: meta.product_name, inline: false }] : [])
-        )
-        .setFooter({ text: BRAND_FOOTER })
-        .setTimestamp(new Date());
-      await logToPurchaseLog(guild, logEmbed);
-      if (type === "product") {
-        await sendThanksIfConfigured(guild, userId, purchaseId);
-      }
-      return res.json({ received: true });
-    }
-
-    if (event.type === "customer.subscription.updated") {
-      const sub = event.data.object;
-      await purchasesCol.updateMany(
-        { stripeSubscriptionId: sub.id, status: "paid" },
-        {
-          $set: {
-            subscriptionStatus: sub.status,
-            cancelAtPeriodEnd: !!sub.cancel_at_period_end,
-            currentPeriodEnd: sub.current_period_end ? new Date(sub.current_period_end * 1000) : null,
-            subscriptionUpdatedAt: new Date(),
-          },
-        }
-      );
-      return res.json({ received: true });
-    }
-
-    if (event.type === "customer.subscription.deleted") {
-      const sub = event.data.object;
-      const purchase = await purchasesCol.findOne(
-        { stripeSubscriptionId: sub.id, status: "paid", type: "product" },
-        { sort: { paidAt: -1 } }
-      );
-      if (purchase) {
-        const guild = await client.guilds.fetch(purchase.guildId).catch(() => null);
-        if (guild) {
-          try {
-            const member = await guild.members.fetch(purchase.userId);
-            if (purchase.roleId) {
-              await member.roles.remove(purchase.roleId, "Subscription ended");
-            }
-          } catch (e) {
-            console.error("Role removal failed:", e);
+          const member = await guild.members.fetch(purchase.userId);
+          if (purchase.roleId) {
+            await member.roles.remove(purchase.roleId, "Subscription ended");
           }
-          const embed = new EmbedBuilder()
-            .setColor(BRAND_COLOR)
-            .setTitle(`${BRAND_NAME} • Subscription Ended`)
-            .addFields(
-              { name: "User", value: `<@${purchase.userId}>`, inline: true },
-              { name: "Purchase ID", value: `\`${purchase.purchaseId}\``, inline: true },
-              { name: "Role removed", value: purchase.roleId ? `<@&${purchase.roleId}>` : "n/a", inline: false }
-            )
-            .setFooter({ text: BRAND_FOOTER })
-            .setTimestamp(new Date());
-          await logToPurchaseLog(guild, embed);
+        } catch (e) {
+          console.error("Role removal failed:", e);
         }
+        const embed = new EmbedBuilder()
+          .setColor(BRAND_COLOR)
+          .setTitle(`${BRAND_NAME} • Subscription Ended`)
+          .addFields(
+            { name: "User", value: `<@${purchase.userId}>`, inline: true },
+            { name: "Purchase ID", value: `\`${purchase.purchaseId}\``, inline: true },
+            { name: "Role removed", value: purchase.roleId ? `<@&${purchase.roleId}>` : "n/a", inline: false }
+          )
+          .setFooter({ text: BRAND_FOOTER })
+          .setTimestamp(new Date());
+        await logToPurchaseLog(guild, embed);
       }
-      await purchasesCol.updateMany(
-        { stripeSubscriptionId: sub.id, status: "paid" },
-        { $set: { subscriptionStatus: "canceled", subscriptionEndedAt: new Date() } }
-      );
-      return res.json({ received: true });
     }
+    await purchasesCol.updateMany(
+      { stripeSubscriptionId: sub.id, status: "paid" },
+      { $set: { subscriptionStatus: "canceled", subscriptionEndedAt: new Date() } }
+    );
+    return;
+  }
+}
+
+app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("❌ Webhook signature failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  try {
+    await handleStripeWebhook(event);
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("Webhook handler error:", err);
+    return res.status(500).send("Webhook handler failed");
+  }
+});
+
+app.post("/api/billing/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("❌ Webhook signature failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  try {
+    await handleStripeWebhook(event);
     return res.json({ received: true });
   } catch (err) {
     console.error("Webhook handler error:", err);
