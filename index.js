@@ -145,10 +145,12 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 function ensureAllowedGuild(interaction) {
   if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) {
-    interaction.reply({
-      content: "This bot is locked to one server. Not this one.",
-      ephemeral: true,
-    }).catch(() => {});
+    interaction
+      .reply({
+        content: "This bot is locked to one server. Not this one.",
+        ephemeral: true,
+      })
+      .catch(() => {});
     return false;
   }
   return true;
@@ -216,13 +218,12 @@ function ticketPlanButtons(product) {
   return [row];
 }
 
+// Close button is back. Humans love buttons.
 function ticketUtilityButtons() {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("ref:add")
-        .setStyle(ButtonStyle.Secondary)
-        .setLabel("Add Reference Code")
+      new ButtonBuilder().setCustomId("ref:add").setStyle(ButtonStyle.Secondary).setLabel("Add Reference Code"),
+      new ButtonBuilder().setCustomId("ticket:close").setStyle(ButtonStyle.Danger).setLabel("Close Ticket")
     ),
   ];
 }
@@ -298,6 +299,27 @@ async function ensureTicketsCategory(guild) {
   });
 }
 
+function buildTicketEmbed({ userId, product, ticketDoc }) {
+  const ref = ticketDoc?.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`";
+  const paidInfo = ticketDoc?.lastPaidAmountMinor
+    ? `\nLast Payment: **${minorToDisplay(ticketDoc.lastPaidAmountMinor)}**`
+    : "";
+
+  return new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setTitle(`${BRAND_NAME} • Purchase Ticket`)
+    .setDescription(
+      `User: <@${userId}>\n` +
+        `Product: **${product.name}**\n` +
+        `${product.description}\n\n` +
+        `Reference Code: ${ref}${paidInfo}\n\n` +
+        `Use **Add Reference Code** (optional), then pick a plan to generate your Stripe Checkout link.`
+    )
+    .addFields({ name: "Plans", value: formatPlans(product.prices), inline: false })
+    .setFooter({ text: BRAND_FOOTER })
+    .setTimestamp(new Date());
+}
+
 async function createOrGetTicketChannel(guild, userId) {
   const existing = await ticketsCol.findOne({ guildId: guild.id, userId, status: "open" });
   if (existing?.channelId) {
@@ -361,9 +383,60 @@ async function createOrGetTicketChannel(guild, userId) {
     status: "open",
     createdAt: new Date(),
     referenceCode: null,
+
+    // message ids we’ll edit later
+    ticketPanelMessageId: null,
+    referenceLogMessageId: null,
+    referenceLoggedAt: null,
+    referencePaidUpdatedAt: null,
+
+    lastPaidAmountMinor: null,
+    lastPurchaseId: null,
   });
 
   return ch;
+}
+
+async function canManageTicket(interaction, ticketDoc) {
+  if (!ticketDoc) return false;
+  if (interaction.user.id === ticketDoc.userId) return true;
+  if (isAdmin(interaction)) return true;
+
+  const cfg = await getConfig(interaction.guild.id);
+  if (cfg?.supportRoleId) {
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    if (member?.roles?.cache?.has(cfg.supportRoleId)) return true;
+  }
+  return false;
+}
+
+async function closeTicket(interaction, ticketDoc) {
+  if (!ticketDoc) return;
+
+  const channel = await interaction.guild.channels.fetch(ticketDoc.channelId).catch(() => null);
+  if (!channel || channel.type !== ChannelType.GuildText) return;
+
+  // lock user from sending more messages
+  await channel.permissionOverwrites.edit(ticketDoc.userId, { SendMessages: false }).catch(() => {});
+  await channel.setName(`closed-${ticketDoc.userId}`.slice(0, 100)).catch(() => {});
+
+  await ticketsCol.updateOne(
+    { guildId: interaction.guild.id, channelId: ticketDoc.channelId, status: "open" },
+    { $set: { status: "closed", closedAt: new Date(), closedBy: interaction.user.id } }
+  );
+
+  const embed = new EmbedBuilder()
+    .setColor(BRAND_COLOR)
+    .setTitle(`${BRAND_NAME} • Ticket Closed`)
+    .setDescription(
+      `Closed by: <@${interaction.user.id}>\n` +
+        `Owner: <@${ticketDoc.userId}>\n` +
+        `Reference: ${ticketDoc.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`"}`
+    )
+    .setFooter({ text: BRAND_FOOTER })
+    .setTimestamp(new Date());
+
+  await channel.send({ embeds: [embed] }).catch(() => {});
 }
 
 // ===================== TICKET PANEL (DROPDOWN) =====================
@@ -596,9 +669,7 @@ const commands = [
     )
     .addStringOption((o) => o.setName("amount").setDescription("Amount (e.g. 9.99) or 'none'").setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName("listproducts")
-    .setDescription("List product IDs and enabled plans"),
+  new SlashCommandBuilder().setName("listproducts").setDescription("List product IDs and enabled plans"),
 
   new SlashCommandBuilder()
     .setName("setthankschannel")
@@ -715,10 +786,16 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "listproducts") {
         if (!requireAdmin(interaction)) return;
 
-        const products = await productsCol.find({ guildId: interaction.guild.id }).sort({ createdAt: -1 }).limit(50).toArray();
+        const products = await productsCol
+          .find({ guildId: interaction.guild.id })
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .toArray();
         if (!products.length) return interaction.reply({ content: "No products.", ephemeral: true });
 
-        const lines = products.map((p) => `• **${p.name}** \`${p._id}\` | ${formatPlans(p.prices)} | role <@&${p.roleId}>`);
+        const lines = products.map(
+          (p) => `• **${p.name}** \`${p._id}\` | ${formatPlans(p.prices)} | role <@&${p.roleId}>`
+        );
         return interaction.reply({ content: lines.join("\n").slice(0, 1900), ephemeral: true });
       }
 
@@ -726,7 +803,8 @@ client.on("interactionCreate", async (interaction) => {
         if (!requireAdmin(interaction)) return;
 
         const ch = interaction.options.getChannel("channel", true);
-        if (!ch || ch.type !== ChannelType.GuildText) return interaction.reply({ content: "Pick a normal text channel.", ephemeral: true });
+        if (!ch || ch.type !== ChannelType.GuildText)
+          return interaction.reply({ content: "Pick a normal text channel.", ephemeral: true });
 
         await upsertConfig(interaction.guild.id, { thanksChannelId: ch.id });
         return interaction.reply({ content: `Thanks channel set to <#${ch.id}>`, ephemeral: true });
@@ -895,32 +973,26 @@ client.on("interactionCreate", async (interaction) => {
         if (!enabledPlans(product.prices).length) return interaction.reply({ content: "No plans enabled for that product.", ephemeral: true });
 
         const ticketCh = await createOrGetTicketChannel(interaction.guild, interaction.user.id);
-
         const ticketDoc = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: ticketCh.id, status: "open" });
-        const ref = ticketDoc?.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`";
 
-        const embed = new EmbedBuilder()
-          .setColor(BRAND_COLOR)
-          .setTitle(`${BRAND_NAME} • Purchase Ticket`)
-          .setDescription(
-            `User: <@${interaction.user.id}>\n` +
-            `Product: **${product.name}**\n` +
-            `${product.description}\n\n` +
-            `Reference Code: ${ref}\n\n` +
-            `Use **Add Reference Code** (optional), then pick a plan to generate your Stripe Checkout link.`
-          )
-          .addFields({ name: "Plans", value: formatPlans(product.prices), inline: false })
-          .setFooter({ text: BRAND_FOOTER })
-          .setTimestamp(new Date());
+        const embed = buildTicketEmbed({ userId: interaction.user.id, product, ticketDoc });
 
-        // Utility row first, then plan buttons
         const components = [...ticketUtilityButtons(), ...ticketPlanButtons(product)];
 
-        await ticketCh.send({
-          content: `<@${interaction.user.id}>`,
-          embeds: [embed],
-          components,
-        });
+        const msg = await ticketCh
+          .send({
+            content: `<@${interaction.user.id}>`,
+            embeds: [embed],
+            components,
+          })
+          .catch(() => null);
+
+        if (msg?.id) {
+          await ticketsCol.updateOne(
+            { guildId: interaction.guild.id, channelId: ticketCh.id, status: "open" },
+            { $set: { ticketPanelMessageId: msg.id, ticketProductId: product._id.toString() } }
+          );
+        }
 
         return interaction.reply({ content: `Ticket ready: <#${ticketCh.id}>`, ephemeral: true });
       }
@@ -939,7 +1011,8 @@ client.on("interactionCreate", async (interaction) => {
 
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid open ticket.", ephemeral: true });
-        if (ticket.userId !== interaction.user.id) return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
+        if (ticket.userId !== interaction.user.id)
+          return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
 
         const entered = interaction.fields.getTextInputValue("refcode").trim().toLowerCase();
 
@@ -947,10 +1020,62 @@ client.on("interactionCreate", async (interaction) => {
           return interaction.reply({ content: "Invalid reference code.", ephemeral: true });
         }
 
+        // store code
         await ticketsCol.updateOne(
           { guildId: interaction.guild.id, channelId, status: "open" },
           { $set: { referenceCode: entered, referenceSetAt: new Date() } }
         );
+
+        // instantly log reference usage as "pending"
+        const guild = interaction.guild;
+        const refCh = await getReferenceLogChannel(guild);
+        let logMsgId = ticket.referenceLogMessageId || null;
+
+        if (refCh && !logMsgId) {
+          const pendingEmbed = new EmbedBuilder()
+            .setColor(BRAND_COLOR)
+            .setTitle(`${BRAND_NAME} • Reference Code Set`)
+            .addFields(
+              { name: "Code", value: `\`${entered}\``, inline: true },
+              { name: "User", value: `<@${interaction.user.id}>`, inline: true },
+              { name: "Status", value: "`set (unpaid)`", inline: true },
+              { name: "Spent", value: "`pending`", inline: true },
+              { name: "Ticket", value: `<#${channelId}>`, inline: true }
+            )
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp(new Date());
+
+          const sent = await refCh.send({ embeds: [pendingEmbed] }).catch(() => null);
+          if (sent?.id) {
+            logMsgId = sent.id;
+            await ticketsCol.updateOne(
+              { guildId: guild.id, channelId, status: "open" },
+              { $set: { referenceLogMessageId: logMsgId, referenceLoggedAt: new Date() } }
+            );
+          }
+        }
+
+        // update the ticket "panel" message so it shows their code immediately
+        try {
+          const freshTicket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
+          if (freshTicket?.ticketPanelMessageId && freshTicket?.ticketProductId) {
+            const product = await productsCol.findOne({
+              _id: new ObjectId(freshTicket.ticketProductId),
+              guildId: interaction.guild.id,
+            });
+
+            const ch = await interaction.guild.channels.fetch(channelId).catch(() => null);
+            if (ch && ch.type === ChannelType.GuildText && product) {
+              const msg = await ch.messages.fetch(freshTicket.ticketPanelMessageId).catch(() => null);
+              if (msg) {
+                const newEmbed = buildTicketEmbed({ userId: interaction.user.id, product, ticketDoc: freshTicket });
+                await msg.edit({ embeds: [newEmbed] }).catch(() => {});
+              }
+            }
+          }
+        } catch {
+          // not fatal
+        }
 
         return interaction.reply({ content: `✅ Reference code set: \`${entered}\``, ephemeral: true });
       }
@@ -960,21 +1085,36 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton()) {
       if (!ensureAllowedGuild(interaction)) return;
 
+      // Close ticket button
+      if (interaction.customId === "ticket:close") {
+        const ticket = await ticketsCol.findOne({
+          guildId: interaction.guild.id,
+          channelId: interaction.channelId,
+          status: "open",
+        });
+        if (!ticket) return interaction.reply({ content: "This isn’t a valid open purchase ticket channel.", ephemeral: true });
+
+        const allowed = await canManageTicket(interaction, ticket);
+        if (!allowed) return interaction.reply({ content: "You don’t have permission to close this ticket.", ephemeral: true });
+
+        await closeTicket(interaction, ticket);
+        return interaction.reply({ content: "Ticket closed.", ephemeral: true });
+      }
+
       // Add reference code button (ticket)
       if (interaction.customId === "ref:add") {
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid purchase ticket channel.", ephemeral: true });
-        if (ticket.userId !== interaction.user.id) return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
+        if (ticket.userId !== interaction.user.id)
+          return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
 
-        const modal = new ModalBuilder()
-          .setCustomId(`refmodal:${interaction.channelId}`)
-          .setTitle(`${BRAND_NAME} • Reference Code`);
+        const modal = new ModalBuilder().setCustomId(`refmodal:${interaction.channelId}`).setTitle(`${BRAND_NAME} • Reference Code`);
 
         const input = new TextInputBuilder()
           .setCustomId("refcode")
-          .setLabel("Enter reference code (optional)")
+          .setLabel("Enter reference code")
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder("e.g. pursuit7")
+          .setPlaceholder("Reference code")
           .setRequired(true)
           .setMaxLength(32);
 
@@ -991,7 +1131,8 @@ client.on("interactionCreate", async (interaction) => {
         // Must be in a valid open ticket and called by ticket owner
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid purchase ticket channel.", ephemeral: true });
-        if (interaction.user.id !== ticket.userId) return interaction.reply({ content: "Only the ticket owner can generate checkout links.", ephemeral: true });
+        if (interaction.user.id !== ticket.userId)
+          return interaction.reply({ content: "Only the ticket owner can generate checkout links.", ephemeral: true });
 
         const product = await productsCol.findOne({ _id: new ObjectId(productId), guildId: interaction.guild.id });
         if (!product) return interaction.reply({ content: "Product not found.", ephemeral: true });
@@ -1016,10 +1157,10 @@ client.on("interactionCreate", async (interaction) => {
               .setTitle(`${BRAND_NAME} • Checkout Link`)
               .setDescription(
                 `Purchase ID: \`${purchaseId}\`\n` +
-                `Product: **${product.name}**\n` +
-                `Plan: **${PLAN_LABELS[planKey]}**\n` +
-                `Reference: ${referenceCode ? `\`${referenceCode}\`` : "`none`"}\n\n` +
-                `Checkout: ${url}`
+                  `Product: **${product.name}**\n` +
+                  `Plan: **${PLAN_LABELS[planKey]}**\n` +
+                  `Reference: ${referenceCode ? `\`${referenceCode}\`` : "`none`"}\n\n` +
+                  `Checkout: ${url}`
               )
               .setFooter({ text: BRAND_FOOTER })
               .setTimestamp(new Date()),
@@ -1050,7 +1191,8 @@ client.on("interactionCreate", async (interaction) => {
           );
 
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`rejected`", inline: true })
+          base
+            .setFields(...fields, { name: "Status", value: "`rejected`", inline: true })
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
 
@@ -1066,7 +1208,8 @@ client.on("interactionCreate", async (interaction) => {
             { $set: { status: "failed", failedAt: new Date(), failureReason: "Purchase not found" } }
           );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`failed (missing purchase)`", inline: true })
+          base
+            .setFields(...fields, { name: "Status", value: "`failed (missing purchase)`", inline: true })
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
           await interaction.editReply({ embeds: [base], components: [] }).catch(() => {});
@@ -1080,7 +1223,8 @@ client.on("interactionCreate", async (interaction) => {
             { $set: { status: "failed", failedAt: new Date(), failureReason: "Refund window expired" } }
           );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`failed (window expired)`", inline: true })
+          base
+            .setFields(...fields, { name: "Status", value: "`failed (window expired)`", inline: true })
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
           await interaction.editReply({ embeds: [base], components: [] }).catch(() => {});
@@ -1111,7 +1255,8 @@ client.on("interactionCreate", async (interaction) => {
           );
 
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`refunded`", inline: true })
+          base
+            .setFields(...fields, { name: "Status", value: "`refunded`", inline: true })
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
 
@@ -1124,7 +1269,8 @@ client.on("interactionCreate", async (interaction) => {
           );
 
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`failed`", inline: true })
+          base
+            .setFields(...fields, { name: "Status", value: "`failed`", inline: true })
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
 
@@ -1275,16 +1421,80 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         await sendThanksIfConfigured(guild, userId, purchaseId);
       }
 
-      // Reference usage log (ONLY if valid code AND purchase paid)
+      // Reference usage log update (log instantly when set, then update on paid amount)
       const ref = (meta.reference_code || "none").toLowerCase();
       const isValidRef = VALID_REFERENCE_CODES.has(ref);
 
       if (isValidRef) {
-        // prevent duplicate logs on webhook retries
+        // prevent duplicate "paid update" work on webhook retries
         const purchaseDoc = await purchasesCol.findOne({ purchaseId, guildId });
-        if (purchaseDoc && !purchaseDoc.referenceLoggedAt) {
+        if (purchaseDoc && !purchaseDoc.referencePaidUpdatedAt) {
           const refCh = await getReferenceLogChannel(guild);
-          if (refCh) {
+
+          // find a matching ticket log message (preferred), otherwise send a fresh paid log
+          const ticket = await ticketsCol.findOne(
+            {
+              guildId,
+              userId,
+              referenceCode: ref,
+              referenceLogMessageId: { $exists: true, $ne: null },
+            },
+            { sort: { referenceLoggedAt: -1 } }
+          );
+
+          let updatedLog = false;
+
+          if (refCh && ticket?.referenceLogMessageId) {
+            const msg = await refCh.messages.fetch(ticket.referenceLogMessageId).catch(() => null);
+            if (msg) {
+              const paidEmbed = new EmbedBuilder()
+                .setColor(BRAND_COLOR)
+                .setTitle(`${BRAND_NAME} • Reference Code Used`)
+                .addFields(
+                  { name: "Code", value: `\`${ref}\``, inline: true },
+                  { name: "User", value: `<@${userId}>`, inline: true },
+                  { name: "Status", value: "`paid`", inline: true },
+                  { name: "Spent", value: amountMinor ? minorToDisplay(amountMinor) : "n/a", inline: true },
+                  { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true },
+                  ...(meta.product_name ? [{ name: "Product", value: meta.product_name, inline: false }] : []),
+                  ...(planKey ? [{ name: "Plan", value: PLAN_LABELS[planKey] || planKey, inline: true }] : [])
+                )
+                .setFooter({ text: BRAND_FOOTER })
+                .setTimestamp(new Date());
+
+              await msg.edit({ embeds: [paidEmbed] }).catch(() => {});
+              updatedLog = true;
+
+              await ticketsCol.updateOne(
+                { _id: ticket._id },
+                {
+                  $set: {
+                    referencePaidUpdatedAt: new Date(),
+                    lastPaidAmountMinor: amountMinor || null,
+                    lastPurchaseId: purchaseId,
+                  },
+                }
+              );
+
+              // also update the ticket panel embed to show code + last paid amount
+              try {
+                const ch = await guild.channels.fetch(ticket.channelId).catch(() => null);
+                if (ch && ch.type === ChannelType.GuildText && ticket.ticketPanelMessageId && ticket.ticketProductId) {
+                  const product = await productsCol.findOne({ _id: new ObjectId(ticket.ticketProductId), guildId });
+                  const freshTicket = await ticketsCol.findOne({ _id: ticket._id });
+                  const panelMsg = await ch.messages.fetch(ticket.ticketPanelMessageId).catch(() => null);
+                  if (panelMsg && product && freshTicket) {
+                    const newEmbed = buildTicketEmbed({ userId, product, ticketDoc: freshTicket });
+                    await panelMsg.edit({ embeds: [newEmbed] }).catch(() => {});
+                  }
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+
+          if (refCh && !updatedLog) {
             const refEmbed = new EmbedBuilder()
               .setColor(BRAND_COLOR)
               .setTitle(`${BRAND_NAME} • Reference Code Used`)
@@ -1304,7 +1514,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
 
           await purchasesCol.updateOne(
             { purchaseId, guildId },
-            { $set: { referenceLoggedAt: new Date() } }
+            { $set: { referencePaidUpdatedAt: new Date() } }
           );
         }
       }
