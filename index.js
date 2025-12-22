@@ -31,7 +31,7 @@ const TICKET_PANEL_CHANNEL_ID = "1452386415814901924";
 const REFERENCE_LOG_CHANNEL_ID = "1452429835677728975";
 
 // ===================== REFERENCE CODES =====================
-const VALID_REFERENCE_CODES = new Set(["pursuit7"]); // case-insensitive compare
+const VALID_REFERENCE_CODES = new Set(["pursuit7", "synex"]); // case-insensitive compare
 
 // ===================== BRANDING =====================
 const BRAND_NAME = "Vivid Tweaks";
