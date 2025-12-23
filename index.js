@@ -1,5 +1,4 @@
 require("dotenv").config();
-
 const {
   Client,
   GatewayIntentBits,
@@ -18,30 +17,24 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
-
 const express = require("express");
 const bodyParser = require("body-parser");
 const Stripe = require("stripe");
 const { MongoClient, ObjectId } = require("mongodb");
-
 // ===================== HARD LOCK =====================
 const ALLOWED_GUILD_ID = "1269702895549419544";
 const REFUND_APPROVER_USER_ID = "1400281740978815118";
 const TICKET_PANEL_CHANNEL_ID = "1452386415814901924";
 const REFERENCE_LOG_CHANNEL_ID = "1452429835677728975";
-
 // ===================== REFERENCE CODES =====================
-const VALID_REFERENCE_CODES = new Set(["pursuit7", "synex", "fearhq"]); // case-insensitive compare
-
+const VALID_REFERENCE_CODES = new Set(["pursuit7", "synex"]); // case-insensitive compare
 // ===================== BRANDING =====================
 const BRAND_NAME = "Vivid Tweaks";
 const BRAND_COLOR = 0x8b5cf6;
 const BRAND_FOOTER = "Vivid Tweaks";
-
 // ===================== MONEY =====================
 const CURRENCY = "gbp";
 const REFUND_WINDOW_MS = 24 * 60 * 60 * 1000;
-
 function amountToMinorUnits(amountStr) {
   if (typeof amountStr !== "string") return null;
   const trimmed = amountStr.trim();
@@ -67,7 +60,6 @@ function makeRefundRequestId() {
     .slice(2, 6)
     .toUpperCase()}`;
 }
-
 // ===================== PLANS =====================
 const PLAN_KEYS = ["one_time", "monthly", "annual", "lifetime"];
 const PLAN_LABELS = {
@@ -80,7 +72,6 @@ const PLAN_INTERVAL = {
   monthly: { interval: "month", interval_count: 1 },
   annual: { interval: "year", interval_count: 1 },
 };
-
 // ===================== ENV =====================
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
@@ -89,65 +80,48 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const PORT = Number(process.env.PORT || 3000);
-
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID");
 if (!MONGODB_URI) throw new Error("Missing MONGODB_URI");
 if (!STRIPE_SECRET_KEY) throw new Error("Missing STRIPE_SECRET_KEY");
 if (!STRIPE_WEBHOOK_SECRET) throw new Error("Missing STRIPE_WEBHOOK_SECRET");
 if (!PUBLIC_BASE_URL) throw new Error("Missing PUBLIC_BASE_URL");
-
 // ===================== STRIPE =====================
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
-
 // ===================== DB =====================
 const mongo = new MongoClient(MONGODB_URI);
 let db;
 let productsCol, configCol, purchasesCol, refundRequestsCol, ticketsCol;
-
 async function initDb() {
   await mongo.connect();
   db = mongo.db();
-
   productsCol = db.collection("products");
   configCol = db.collection("shop_config");
   purchasesCol = db.collection("purchases");
   refundRequestsCol = db.collection("refund_requests");
   ticketsCol = db.collection("tickets");
-
   await productsCol.createIndex({ guildId: 1, createdAt: -1 });
   await configCol.createIndex({ guildId: 1 }, { unique: true });
-
   await purchasesCol.createIndex({ purchaseId: 1 }, { unique: true });
   await purchasesCol.createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true });
   await purchasesCol.createIndex({ stripeSubscriptionId: 1 }, { sparse: true });
   await purchasesCol.createIndex({ guildId: 1, paidAt: -1 });
-
   await refundRequestsCol.createIndex({ requestId: 1 }, { unique: true });
   await refundRequestsCol.createIndex({ guildId: 1, createdAt: -1 });
-
   await ticketsCol.createIndex({ guildId: 1, userId: 1, status: 1 });
+  await ticketsCol.createIndex({ guildId: 1, channelId: 1 }, { unique: true });
   await ticketsCol.createIndex({ guildId: 1, userId: 1, createdAt: -1 });
-
-  // FIX: unique index must not include null channelId
-  try {
-    await ticketsCol.dropIndex("guildId_1_channelId_1");
-  } catch {}
-  await ticketsCol.createIndex(
-    { guildId: 1, channelId: 1 },
-    { unique: true, partialFilterExpression: { channelId: { $type: "string" } } }
-  );
-
   console.log("✅ MongoDB connected");
 }
-
 // ===================== DISCORD =====================
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
 function ensureAllowedGuild(interaction) {
   if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) {
     interaction
-      .reply({ content: "This bot is locked to one server. Not this one.", ephemeral: true })
+      .reply({
+        content: "This bot is locked to one server. Not this one.",
+        ephemeral: true,
+      })
       .catch(() => {});
     return false;
   }
@@ -167,7 +141,6 @@ function requireAdmin(interaction) {
   }
   return true;
 }
-
 // ===================== CONFIG =====================
 async function getConfig(guildId) {
   return (await configCol.findOne({ guildId })) || null;
@@ -179,11 +152,12 @@ async function upsertConfig(guildId, patch) {
     { upsert: true }
   );
 }
-
 // ===================== PRODUCT HELPERS =====================
 function enabledPlans(pricesObj) {
   const out = [];
-  for (const key of PLAN_KEYS) if (pricesObj?.[key]?.amountMinor) out.push(key);
+  for (const key of PLAN_KEYS) {
+    if (pricesObj?.[key]?.amountMinor) out.push(key);
+  }
   return out;
 }
 function formatPlans(pricesObj) {
@@ -215,17 +189,13 @@ function ticketUtilityButtons() {
     ),
   ];
 }
-
 // ===================== CHANNEL HELPERS =====================
 async function ensurePurchaseLogChannel(guild) {
-  await guild.channels.fetch().catch(() => {});
-
   const cfg = await getConfig(guild.id);
   if (cfg?.purchaseLogChannelId) {
     const ch = await guild.channels.fetch(cfg.purchaseLogChannelId).catch(() => null);
     if (ch && ch.type === ChannelType.GuildText) return ch;
   }
-
   const existing = guild.channels.cache.find(
     (c) => c.type === ChannelType.GuildText && c.name === "purchase-log"
   );
@@ -233,7 +203,6 @@ async function ensurePurchaseLogChannel(guild) {
     await upsertConfig(guild.id, { purchaseLogChannelId: existing.id });
     return existing;
   }
-
   const created = await guild.channels.create({
     name: "purchase-log",
     type: ChannelType.GuildText,
@@ -258,47 +227,50 @@ async function sendThanksIfConfigured(guild, userId, purchaseId) {
   if (!cfg?.thanksChannelId) return;
   const ch = await guild.channels.fetch(cfg.thanksChannelId).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return;
-
   const embed = new EmbedBuilder()
     .setColor(BRAND_COLOR)
     .setTitle(`${BRAND_NAME} • Thank you!`)
-    .setDescription(`Thanks for buying <@${userId}> 💜\nPurchase ID: \`${purchaseId}\``)
+    .setDescription(`Thanks for buying <@${userId}> 💜
+Purchase ID: \`${purchaseId}\``)
     .setFooter({ text: BRAND_FOOTER })
     .setTimestamp(new Date());
-
   await ch.send({ embeds: [embed] }).catch(() => {});
 }
-
 // ===================== TICKETS =====================
 async function ensureTicketsCategory(guild) {
-  await guild.channels.fetch().catch(() => {});
   const existing = guild.channels.cache.find(
     (c) => c.type === ChannelType.GuildCategory && c.name === "vivid-tickets"
   );
   if (existing) return existing;
-  return guild.channels.create({ name: "vivid-tickets", type: ChannelType.GuildCategory });
+  return guild.channels.create({
+    name: "vivid-tickets",
+    type: ChannelType.GuildCategory,
+  });
 }
-
 function buildTicketEmbed({ userId, product, ticketDoc }) {
   const ref = ticketDoc?.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`";
   const paidInfo = ticketDoc?.lastPaidAmountMinor
-    ? `\nLast Payment: **${minorToDisplay(ticketDoc.lastPaidAmountMinor)}**`
+    ? `
+Last Payment: **${minorToDisplay(ticketDoc.lastPaidAmountMinor)}**`
     : "";
   return new EmbedBuilder()
     .setColor(BRAND_COLOR)
     .setTitle(`${BRAND_NAME} • Purchase Ticket`)
     .setDescription(
-      `User: <@${userId}>\n` +
-        `Product: **${product.name}**\n` +
-        `${product.description}\n` +
-        `Reference Code: ${ref}${paidInfo}\n` +
+      `User: <@${userId}>
+` +
+        `Product: **${product.name}**
+` +
+        `${product.description}
+` +
+        `Reference Code: ${ref}${paidInfo}
+` +
         `Use **Add Reference Code** (optional), then pick a plan to generate your Stripe Checkout link.`
     )
     .addFields({ name: "Plans", value: formatPlans(product.prices), inline: false })
     .setFooter({ text: BRAND_FOOTER })
     .setTimestamp(new Date());
 }
-
 async function createOrGetTicketChannel(guild, userId) {
   const existing = await ticketsCol.findOne({ guildId: guild.id, userId, status: "open" });
   if (existing?.channelId) {
@@ -310,19 +282,23 @@ async function createOrGetTicketChannel(guild, userId) {
     );
   }
 
+  // Prevent double creation
   const inFlight = await ticketsCol.findOne({ guildId: guild.id, userId, status: "creating" });
-  if (inFlight?.channelId) {
+  if (inFlight) {
     const ch = await guild.channels.fetch(inFlight.channelId).catch(() => null);
     if (ch && ch.type === ChannelType.GuildText) {
-      await ticketsCol.updateOne({ _id: inFlight._id }, { $set: { status: "open" } });
+      await ticketsCol.updateOne(
+        { _id: inFlight._id },
+        { $set: { status: "open" } }
+      );
       return ch;
     }
+    // If channel is gone, clean up and proceed
+    await ticketsCol.deleteOne({ _id: inFlight._id });
   }
-  if (inFlight) await ticketsCol.deleteOne({ _id: inFlight._id }).catch(() => {});
 
   const cfg = await getConfig(guild.id);
   const supportRoleId = cfg?.supportRoleId || null;
-
   const category = await ensureTicketsCategory(guild);
   const overwrites = [
     { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
@@ -355,9 +331,10 @@ async function createOrGetTicketChannel(guild, userId) {
     });
   }
 
-  // FIX: do not set channelId:null
+  // Mark as creating to prevent double tickets
   const tempDoc = await ticketsCol.insertOne({
     guildId: guild.id,
+    channelId: null,
     userId,
     status: "creating",
     createdAt: new Date(),
@@ -377,19 +354,23 @@ async function createOrGetTicketChannel(guild, userId) {
     permissionOverwrites: overwrites,
   });
 
+  // Finalize with real channelId
   await ticketsCol.updateOne(
     { _id: tempDoc.insertedId },
-    { $set: { channelId: ch.id, status: "open" } }
+    {
+      $set: {
+        channelId: ch.id,
+        status: "open",
+      },
+    }
   );
 
   return ch;
 }
-
 async function canManageTicket(interaction, ticketDoc) {
   if (!ticketDoc) return false;
   if (interaction.user.id === ticketDoc.userId) return true;
   if (isAdmin(interaction)) return true;
-
   const cfg = await getConfig(interaction.guild.id);
   if (cfg?.supportRoleId) {
     const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
@@ -397,40 +378,39 @@ async function canManageTicket(interaction, ticketDoc) {
   }
   return false;
 }
-
 async function closeTicket(interaction, ticketDoc) {
   if (!ticketDoc) return;
   const channel = await interaction.guild.channels.fetch(ticketDoc.channelId).catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildText) return;
-
+  // lock user from sending more messages
   await channel.permissionOverwrites.edit(ticketDoc.userId, { SendMessages: false }).catch(() => {});
   await channel.setName(`closed-${ticketDoc.userId}`.slice(0, 100)).catch(() => {});
-
   await ticketsCol.updateOne(
     { guildId: interaction.guild.id, channelId: ticketDoc.channelId, status: "open" },
     { $set: { status: "closed", closedAt: new Date(), closedBy: interaction.user.id } }
   );
-
   const embed = new EmbedBuilder()
     .setColor(BRAND_COLOR)
     .setTitle(`${BRAND_NAME} • Ticket Closed`)
     .setDescription(
-      `Closed by: <@${interaction.user.id}>\n` +
-        `Owner: <@${ticketDoc.userId}>\n` +
+      `Closed by: <@${interaction.user.id}>
+` +
+        `Owner: <@${ticketDoc.userId}>
+` +
         `Reference: ${ticketDoc.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`"}`
     )
     .setFooter({ text: BRAND_FOOTER })
     .setTimestamp(new Date());
-
-  // FIX: log elsewhere, then delete
-  await logToPurchaseLog(interaction.guild, embed).catch(() => {});
+  await channel.send({ embeds: [embed] }).catch(() => {});
   await channel.delete().catch(() => {});
 }
-
-// ===================== TICKET PANEL =====================
+// ===================== TICKET PANEL (DROPDOWN) =====================
 async function buildTicketPanelPayload(guildId) {
-  const products = await productsCol.find({ guildId }).sort({ createdAt: -1 }).limit(25).toArray();
-
+  const products = await productsCol
+    .find({ guildId })
+    .sort({ createdAt: -1 })
+    .limit(25)
+    .toArray();
   const embed = new EmbedBuilder()
     .setColor(BRAND_COLOR)
     .setTitle(`${BRAND_NAME} • Purchase Tickets`)
@@ -440,7 +420,6 @@ async function buildTicketPanelPayload(guildId) {
         : "No products yet. Admins: /addproduct"
     )
     .setFooter({ text: BRAND_FOOTER });
-
   const components = [];
   if (products.length) {
     const menu = new StringSelectMenuBuilder()
@@ -448,7 +427,6 @@ async function buildTicketPanelPayload(guildId) {
       .setPlaceholder("Select a product to open a purchase ticket")
       .setMinValues(1)
       .setMaxValues(1);
-
     for (const p of products) {
       menu.addOptions(
         new StringSelectMenuOptionBuilder()
@@ -459,37 +437,31 @@ async function buildTicketPanelPayload(guildId) {
     }
     components.push(new ActionRowBuilder().addComponents(menu));
   }
-
   return { embeds: [embed], components };
 }
-
 async function upsertTicketPanel(guild) {
   const ch = await guild.channels.fetch(TICKET_PANEL_CHANNEL_ID).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return;
-
   const payload = await buildTicketPanelPayload(guild.id);
   const cfg = await getConfig(guild.id);
-
   if (cfg?.ticketPanelMessageId) {
     try {
       const msg = await ch.messages.fetch(cfg.ticketPanelMessageId);
       await msg.edit(payload);
       return;
-    } catch {}
+    } catch {
+      // recreate
+    }
   }
-
   const msg = await ch.send(payload);
   await upsertConfig(guild.id, { ticketPanelMessageId: msg.id });
 }
-
-// ===================== STRIPE CHECKOUT =====================
+// ===================== STRIPE CHECKOUT (amount-based) =====================
 function makeLineItemForProduct(product, planKey) {
   const plan = product.prices?.[planKey];
   if (!plan?.amountMinor) throw new Error("Plan not available");
-
   const isSub = planKey === "monthly" || planKey === "annual";
   const recurring = isSub ? PLAN_INTERVAL[planKey] : undefined;
-
   return {
     price_data: {
       currency: CURRENCY,
@@ -516,11 +488,9 @@ function makeLineItemForDonation(amountMinor) {
     quantity: 1,
   };
 }
-
 async function createCheckoutSessionForProduct({ guildId, userId, product, planKey, purchaseId, referenceCode }) {
   const isSubscription = planKey === "monthly" || planKey === "annual";
   const lineItem = makeLineItemForProduct(product, planKey);
-
   const session = await stripe.checkout.sessions.create({
     mode: isSubscription ? "subscription" : "payment",
     line_items: [lineItem],
@@ -540,7 +510,6 @@ async function createCheckoutSessionForProduct({ guildId, userId, product, planK
       reference_code: referenceCode || "none",
     },
   });
-
   await purchasesCol.insertOne({
     purchaseId,
     guildId,
@@ -557,13 +526,10 @@ async function createCheckoutSessionForProduct({ guildId, userId, product, planK
     status: "created",
     createdAt: new Date(),
   });
-
   return session.url;
 }
-
 async function createCheckoutSessionForDonation({ guildId, userId, amountMinor, purchaseId }) {
   const lineItem = makeLineItemForDonation(amountMinor);
-
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     line_items: [lineItem],
@@ -579,7 +545,6 @@ async function createCheckoutSessionForDonation({ guildId, userId, amountMinor, 
       reference_code: "none",
     },
   });
-
   await purchasesCol.insertOne({
     purchaseId,
     guildId,
@@ -591,14 +556,11 @@ async function createCheckoutSessionForDonation({ guildId, userId, amountMinor, 
     status: "created",
     createdAt: new Date(),
   });
-
   return session.url;
 }
-
 // ===================== REFUNDS (internal only) =====================
 async function executeRefundInternal(purchase) {
   let refundId = null;
-
   if (purchase.stripePaymentIntentId) {
     const refund = await stripe.refunds.create({ payment_intent: purchase.stripePaymentIntentId });
     refundId = refund.id;
@@ -615,10 +577,8 @@ async function executeRefundInternal(purchase) {
   } else {
     throw new Error("No Stripe payment references on record.");
   }
-
   return refundId;
 }
-
 // ===================== SLASH COMMANDS =====================
 const commands = [
   new SlashCommandBuilder()
@@ -631,81 +591,65 @@ const commands = [
     .addStringOption((o) => o.setName("monthly").setDescription("Monthly amount (e.g. 4.99)"))
     .addStringOption((o) => o.setName("annual").setDescription("Annual amount (e.g. 49.99)"))
     .addStringOption((o) => o.setName("lifetime").setDescription("Lifetime amount (e.g. 199.99)")),
-
   new SlashCommandBuilder()
     .setName("setprice")
     .setDescription("Set/disable a plan amount on an existing product")
     .addStringOption((o) => o.setName("product_id").setDescription("Product ID").setRequired(true))
     .addStringOption((o) =>
-      o
-        .setName("plan")
-        .setDescription("Plan")
-        .setRequired(true)
-        .addChoices(
-          { name: "one_time", value: "one_time" },
-          { name: "monthly", value: "monthly" },
-          { name: "annual", value: "annual" },
-          { name: "lifetime", value: "lifetime" }
-        )
+      o.setName("plan").setDescription("Plan").setRequired(true).addChoices(
+        { name: "one_time", value: "one_time" },
+        { name: "monthly", value: "monthly" },
+        { name: "annual", value: "annual" },
+        { name: "lifetime", value: "lifetime" }
+      )
     )
     .addStringOption((o) => o.setName("amount").setDescription("Amount (e.g. 9.99) or 'none'").setRequired(true)),
-
   new SlashCommandBuilder().setName("listproducts").setDescription("List product IDs and enabled plans"),
-
   new SlashCommandBuilder()
     .setName("setthankschannel")
     .setDescription("Set channel for 'thanks for buying' embeds")
     .addChannelOption((o) => o.setName("channel").setDescription("Text channel").setRequired(true)),
-
   new SlashCommandBuilder()
     .setName("setsupportrole")
     .setDescription("Set support role for ticket channels (optional)")
     .addRoleOption((o) => o.setName("role").setDescription("Support role").setRequired(true)),
-
-  new SlashCommandBuilder().setName("ticketpanel").setDescription("Repost/update the ticket panel in the fixed panel channel"),
-
+  new SlashCommandBuilder()
+    .setName("ticketpanel")
+    .setDescription("Repost/update the ticket panel in the fixed panel channel"),
   new SlashCommandBuilder()
     .setName("donate")
     .setDescription("Donate (one-time)")
     .addStringOption((o) => o.setName("amount").setDescription("Amount (e.g. 5 or 9.99)").setRequired(true)),
-
   new SlashCommandBuilder()
     .setName("refund")
     .setDescription("Request a refund by Purchase ID (approval required; within 24h)")
     .addStringOption((o) => o.setName("purchase_id").setDescription("Purchase ID (VT-...)").setRequired(true)),
-
   new SlashCommandBuilder()
     .setName("cancelsub")
     .setDescription("Cancel your active subscription (keeps access until period ends)"),
 ].map((c) => c.toJSON());
-
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, ALLOWED_GUILD_ID), { body: commands });
   console.log("✅ Guild slash commands registered");
 }
-
 // ===================== INTERACTIONS =====================
 client.on("interactionCreate", async (interaction) => {
   try {
     // ---------- Chat commands ----------
     if (interaction.isChatInputCommand()) {
       if (!ensureAllowedGuild(interaction)) return;
-
       if (interaction.commandName === "addproduct") {
         if (!requireAdmin(interaction)) return;
-
         const name = interaction.options.getString("name", true);
         const description = interaction.options.getString("description", true);
         const role = interaction.options.getRole("role", true);
-
         const raw = {
           one_time: interaction.options.getString("one_time"),
           monthly: interaction.options.getString("monthly"),
           annual: interaction.options.getString("annual"),
           lifetime: interaction.options.getString("lifetime"),
         };
-
         const prices = {};
         for (const k of PLAN_KEYS) {
           if (!raw[k]) continue;
@@ -716,7 +660,6 @@ client.on("interactionCreate", async (interaction) => {
         if (!enabledPlans(prices).length) {
           return interaction.reply({ content: "You must set at least one plan amount.", ephemeral: true });
         }
-
         const doc = await productsCol.insertOne({
           guildId: interaction.guild.id,
           name,
@@ -725,26 +668,20 @@ client.on("interactionCreate", async (interaction) => {
           prices,
           createdAt: new Date(),
         });
-
         await upsertTicketPanel(interaction.guild).catch(() => {});
         return interaction.reply({
           content: `Added **${name}** (ID: \`${doc.insertedId.toString()}\`) with plans: ${formatPlans(prices)}`,
           ephemeral: true,
         });
       }
-
       if (interaction.commandName === "setprice") {
         if (!requireAdmin(interaction)) return;
-
         const productId = interaction.options.getString("product_id", true);
         const plan = interaction.options.getString("plan", true);
         const amountRaw = interaction.options.getString("amount", true).trim().toLowerCase();
-
         if (!ObjectId.isValid(productId)) return interaction.reply({ content: "Invalid product id.", ephemeral: true });
-
         const product = await productsCol.findOne({ _id: new ObjectId(productId), guildId: interaction.guild.id });
         if (!product) return interaction.reply({ content: "Product not found.", ephemeral: true });
-
         if (amountRaw === "none" || amountRaw === "disable" || amountRaw === "off") {
           await productsCol.updateOne({ _id: new ObjectId(productId) }, { $unset: { [`prices.${plan}`]: "" } });
         } else {
@@ -755,53 +692,46 @@ client.on("interactionCreate", async (interaction) => {
             { $set: { [`prices.${plan}`]: { amountMinor: minor } } }
           );
         }
-
         await upsertTicketPanel(interaction.guild).catch(() => {});
         return interaction.reply({ content: `Updated plan **${plan}** for \`${productId}\`.`, ephemeral: true });
       }
-
       if (interaction.commandName === "listproducts") {
         if (!requireAdmin(interaction)) return;
-
-        const products = await productsCol.find({ guildId: interaction.guild.id }).sort({ createdAt: -1 }).limit(50).toArray();
+        const products = await productsCol
+          .find({ guildId: interaction.guild.id })
+          .sort({ createdAt: -1 })
+          .limit(50)
+          .toArray();
         if (!products.length) return interaction.reply({ content: "No products.", ephemeral: true });
-
         const lines = products.map(
           (p) => `• **${p.name}** \`${p._id}\` | ${formatPlans(p.prices)} | role <@&${p.roleId}>`
         );
-
         return interaction.reply({ content: lines.join("\n").slice(0, 1900), ephemeral: true });
       }
-
       if (interaction.commandName === "setthankschannel") {
         if (!requireAdmin(interaction)) return;
         const ch = interaction.options.getChannel("channel", true);
-        if (!ch || ch.type !== ChannelType.GuildText) {
+        if (!ch || ch.type !== ChannelType.GuildText)
           return interaction.reply({ content: "Pick a normal text channel.", ephemeral: true });
-        }
         await upsertConfig(interaction.guild.id, { thanksChannelId: ch.id });
         return interaction.reply({ content: `Thanks channel set to <#${ch.id}>`, ephemeral: true });
       }
-
       if (interaction.commandName === "setsupportrole") {
         if (!requireAdmin(interaction)) return;
         const role = interaction.options.getRole("role", true);
         await upsertConfig(interaction.guild.id, { supportRoleId: role.id });
         return interaction.reply({ content: `Support role set to <@&${role.id}>`, ephemeral: true });
       }
-
       if (interaction.commandName === "ticketpanel") {
         if (!requireAdmin(interaction)) return;
         await upsertTicketPanel(interaction.guild).catch(() => {});
         return interaction.reply({ content: "Ticket panel updated.", ephemeral: true });
       }
-
       if (interaction.commandName === "donate") {
         const amountRaw = interaction.options.getString("amount", true);
         const minor = amountToMinorUnits(amountRaw);
         if (!minor) return interaction.reply({ content: "Invalid amount. Example: 5 or 9.99", ephemeral: true });
         if (minor < 100) return interaction.reply({ content: "Minimum donation is £1.00", ephemeral: true });
-
         const purchaseId = makePurchaseId();
         const url = await createCheckoutSessionForDonation({
           guildId: interaction.guild.id,
@@ -809,28 +739,21 @@ client.on("interactionCreate", async (interaction) => {
           amountMinor: minor,
           purchaseId,
         });
-
-        return interaction.reply({
-          content: `Donation Checkout link (Purchase ID: \`${purchaseId}\`):\n${url}`,
-          ephemeral: true,
-        });
+        return interaction.reply({ content: `Donation Checkout link (Purchase ID: \`${purchaseId}\`):
+${url}`, ephemeral: true });
       }
-
-      // /refund -> approval request
+      // /refund -> creates approval request (does not refund instantly)
       if (interaction.commandName === "refund") {
         if (!requireAdmin(interaction)) return;
-
         const purchaseId = interaction.options.getString("purchase_id", true).trim();
         const purchase = await purchasesCol.findOne({ purchaseId, guildId: interaction.guild.id });
         if (!purchase) return interaction.reply({ content: "Purchase not found.", ephemeral: true });
         if (purchase.status !== "paid") return interaction.reply({ content: `Purchase status is \`${purchase.status}\`.`, ephemeral: true });
-
         const paidAt = purchase.paidAt ? new Date(purchase.paidAt) : null;
         if (!paidAt) return interaction.reply({ content: "No paidAt recorded. Can't refund safely.", ephemeral: true });
         if (Date.now() - paidAt.getTime() > REFUND_WINDOW_MS) {
           return interaction.reply({ content: "Refund window expired (over 24 hours).", ephemeral: true });
         }
-
         const requestId = makeRefundRequestId();
         await refundRequestsCol.insertOne({
           requestId,
@@ -840,7 +763,6 @@ client.on("interactionCreate", async (interaction) => {
           status: "pending",
           createdAt: new Date(),
         });
-
         const embed = new EmbedBuilder()
           .setColor(BRAND_COLOR)
           .setTitle(`${BRAND_NAME} • Refund Request`)
@@ -854,20 +776,16 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setFooter({ text: BRAND_FOOTER })
           .setTimestamp(new Date());
-
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`refund_approve:${requestId}`).setStyle(ButtonStyle.Success).setLabel("Approve"),
           new ButtonBuilder().setCustomId(`refund_reject:${requestId}`).setStyle(ButtonStyle.Danger).setLabel("Reject")
         );
-
         await logToPurchaseLog(interaction.guild, embed, [row]);
         return interaction.reply({ content: `Refund request created: \`${requestId}\` (awaiting approval).`, ephemeral: true });
       }
-
       // /cancelsub
       if (interaction.commandName === "cancelsub") {
         await interaction.deferReply({ ephemeral: true });
-
         const purchase = await purchasesCol.findOne(
           {
             guildId: interaction.guild.id,
@@ -879,9 +797,7 @@ client.on("interactionCreate", async (interaction) => {
           },
           { sort: { paidAt: -1 } }
         );
-
         if (!purchase) return interaction.editReply("You don’t have an active subscription purchase on record.");
-
         let sub;
         try {
           sub = await stripe.subscriptions.retrieve(purchase.stripeSubscriptionId);
@@ -889,7 +805,6 @@ client.on("interactionCreate", async (interaction) => {
           console.error("Subscription retrieve failed:", e);
           return interaction.editReply("Couldn’t find your subscription in Stripe. Contact support.");
         }
-
         if (sub.status === "canceled") {
           await purchasesCol.updateMany(
             { stripeSubscriptionId: sub.id, status: "paid" },
@@ -897,14 +812,12 @@ client.on("interactionCreate", async (interaction) => {
           );
           return interaction.editReply("Your subscription is already canceled.");
         }
-
         try {
           sub = await stripe.subscriptions.update(purchase.stripeSubscriptionId, { cancel_at_period_end: true });
         } catch (e) {
           console.error("Cancel update failed:", e);
           return interaction.editReply("Stripe refused to cancel your subscription. Contact support.");
         }
-
         await purchasesCol.updateMany(
           { stripeSubscriptionId: sub.id, status: "paid" },
           {
@@ -916,7 +829,6 @@ client.on("interactionCreate", async (interaction) => {
             },
           }
         );
-
         const embed = new EmbedBuilder()
           .setColor(BRAND_COLOR)
           .setTitle(`${BRAND_NAME} • Subscription Cancellation Requested`)
@@ -927,70 +839,64 @@ client.on("interactionCreate", async (interaction) => {
           )
           .setFooter({ text: BRAND_FOOTER })
           .setTimestamp(new Date());
-
         await logToPurchaseLog(interaction.guild, embed);
         return interaction.editReply("Subscription canceled. You keep access until the end of your billing period.");
       }
     }
-
-    // Ticket dropdown
+    // ---------- Ticket dropdown ----------
     if (interaction.isStringSelectMenu()) {
       if (!ensureAllowedGuild(interaction)) return;
-
       if (interaction.customId === "ticket_product_select") {
         const productId = interaction.values[0];
         if (!ObjectId.isValid(productId)) return interaction.reply({ content: "Invalid product selection.", ephemeral: true });
-
         const product = await productsCol.findOne({ _id: new ObjectId(productId), guildId: interaction.guild.id });
         if (!product) return interaction.reply({ content: "Product not found.", ephemeral: true });
         if (!enabledPlans(product.prices).length) return interaction.reply({ content: "No plans enabled for that product.", ephemeral: true });
-
         const ticketCh = await createOrGetTicketChannel(interaction.guild, interaction.user.id);
         const ticketDoc = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: ticketCh.id, status: "open" });
-
         const embed = buildTicketEmbed({ userId: interaction.user.id, product, ticketDoc });
         const components = [...ticketUtilityButtons(), ...ticketPlanButtons(product)];
-
-        const msg = await ticketCh.send({
-          content: `<@${interaction.user.id}>`,
-          embeds: [embed],
-          components,
-        }).catch(() => null);
-
+        const msg = await ticketCh
+          .send({
+            content: `<@${interaction.user.id}>`,
+            embeds: [embed],
+            components,
+          })
+          .catch(() => null);
         if (msg?.id) {
           await ticketsCol.updateOne(
             { guildId: interaction.guild.id, channelId: ticketCh.id, status: "open" },
             { $set: { ticketPanelMessageId: msg.id, ticketProductId: product._id.toString() } }
           );
         }
-
         return interaction.reply({ content: `Ticket ready: <#${ticketCh.id}>`, ephemeral: true });
       }
     }
-
-    // Modals
+    // ---------- Modals ----------
     if (interaction.isModalSubmit()) {
       if (!ensureAllowedGuild(interaction)) return;
-
       if (interaction.customId.startsWith("refmodal:")) {
         const channelId = interaction.customId.split(":")[1];
-        if (interaction.channelId !== channelId) return interaction.reply({ content: "Wrong channel for that modal.", ephemeral: true });
-
+        if (interaction.channelId !== channelId) {
+          return interaction.reply({ content: "Wrong channel for that modal.", ephemeral: true });
+        }
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid open ticket.", ephemeral: true });
-        if (ticket.userId !== interaction.user.id) return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
-
+        if (ticket.userId !== interaction.user.id)
+          return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
         const entered = interaction.fields.getTextInputValue("refcode").trim().toLowerCase();
-        if (!VALID_REFERENCE_CODES.has(entered)) return interaction.reply({ content: "Invalid reference code.", ephemeral: true });
-
+        if (!VALID_REFERENCE_CODES.has(entered)) {
+          return interaction.reply({ content: "Invalid reference code.", ephemeral: true });
+        }
+        // store code
         await ticketsCol.updateOne(
           { guildId: interaction.guild.id, channelId, status: "open" },
           { $set: { referenceCode: entered, referenceSetAt: new Date() } }
         );
-
-        const refCh = await getReferenceLogChannel(interaction.guild);
+        // instantly log reference usage as "pending"
+        const guild = interaction.guild;
+        const refCh = await getReferenceLogChannel(guild);
         let logMsgId = ticket.referenceLogMessageId || null;
-
         if (refCh && !logMsgId) {
           const pendingEmbed = new EmbedBuilder()
             .setColor(BRAND_COLOR)
@@ -1004,22 +910,23 @@ client.on("interactionCreate", async (interaction) => {
             )
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
-
           const sent = await refCh.send({ embeds: [pendingEmbed] }).catch(() => null);
           if (sent?.id) {
             logMsgId = sent.id;
             await ticketsCol.updateOne(
-              { guildId: interaction.guild.id, channelId, status: "open" },
+              { guildId: guild.id, channelId, status: "open" },
               { $set: { referenceLogMessageId: logMsgId, referenceLoggedAt: new Date() } }
             );
           }
         }
-
-        // update ticket panel message to show the ref
+        // update the ticket "panel" message so it shows their code immediately
         try {
           const freshTicket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
           if (freshTicket?.ticketPanelMessageId && freshTicket?.ticketProductId) {
-            const product = await productsCol.findOne({ _id: new ObjectId(freshTicket.ticketProductId), guildId: interaction.guild.id });
+            const product = await productsCol.findOne({
+              _id: new ObjectId(freshTicket.ticketProductId),
+              guildId: interaction.guild.id,
+            });
             const ch = await interaction.guild.channels.fetch(channelId).catch(() => null);
             if (ch && ch.type === ChannelType.GuildText && product) {
               const msg = await ch.messages.fetch(freshTicket.ticketPanelMessageId).catch(() => null);
@@ -1029,30 +936,34 @@ client.on("interactionCreate", async (interaction) => {
               }
             }
           }
-        } catch {}
-
+        } catch {
+          // not fatal
+        }
         return interaction.reply({ content: `✅ Reference code set: \`${entered}\``, ephemeral: true });
       }
     }
-
-    // Buttons
+    // ---------- Buttons ----------
     if (interaction.isButton()) {
       if (!ensureAllowedGuild(interaction)) return;
-
+      // Close ticket button
       if (interaction.customId === "ticket:close") {
-        const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
+        const ticket = await ticketsCol.findOne({
+          guildId: interaction.guild.id,
+          channelId: interaction.channelId,
+          status: "open",
+        });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid open purchase ticket channel.", ephemeral: true });
         const allowed = await canManageTicket(interaction, ticket);
         if (!allowed) return interaction.reply({ content: "You don’t have permission to close this ticket.", ephemeral: true });
         await closeTicket(interaction, ticket);
         return interaction.reply({ content: "Ticket closed.", ephemeral: true });
       }
-
+      // Add reference code button (ticket)
       if (interaction.customId === "ref:add") {
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid purchase ticket channel.", ephemeral: true });
-        if (ticket.userId !== interaction.user.id) return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
-
+        if (ticket.userId !== interaction.user.id)
+          return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
         const modal = new ModalBuilder().setCustomId(`refmodal:${interaction.channelId}`).setTitle(`${BRAND_NAME} • Reference Code`);
         const input = new TextInputBuilder()
           .setCustomId("refcode")
@@ -1061,27 +972,24 @@ client.on("interactionCreate", async (interaction) => {
           .setPlaceholder("Reference code")
           .setRequired(true)
           .setMaxLength(32);
-
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
       }
-
+      // Ticket plan buttons -> generate checkout link in ticket
       if (interaction.customId.startsWith("tp:")) {
         const [, productId, planKey] = interaction.customId.split(":");
         if (!ObjectId.isValid(productId)) return interaction.reply({ content: "Invalid product.", ephemeral: true });
         if (!PLAN_KEYS.includes(planKey)) return interaction.reply({ content: "Invalid plan.", ephemeral: true });
-
+        // Must be in a valid open ticket and called by ticket owner
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid purchase ticket channel.", ephemeral: true });
-        if (interaction.user.id !== ticket.userId) return interaction.reply({ content: "Only the ticket owner can generate checkout links.", ephemeral: true });
-
+        if (interaction.user.id !== ticket.userId)
+          return interaction.reply({ content: "Only the ticket owner can generate checkout links.", ephemeral: true });
         const product = await productsCol.findOne({ _id: new ObjectId(productId), guildId: interaction.guild.id });
         if (!product) return interaction.reply({ content: "Product not found.", ephemeral: true });
         if (!product.prices?.[planKey]?.amountMinor) return interaction.reply({ content: "That plan is not available.", ephemeral: true });
-
         const referenceCode = ticket.referenceCode && VALID_REFERENCE_CODES.has(ticket.referenceCode) ? ticket.referenceCode : null;
         const purchaseId = makePurchaseId();
-
         const url = await createCheckoutSessionForProduct({
           guildId: interaction.guild.id,
           userId: interaction.user.id,
@@ -1090,92 +998,116 @@ client.on("interactionCreate", async (interaction) => {
           purchaseId,
           referenceCode,
         });
-
         await interaction.channel.send({
           embeds: [
             new EmbedBuilder()
               .setColor(BRAND_COLOR)
               .setTitle(`${BRAND_NAME} • Checkout Link`)
               .setDescription(
-                `Purchase ID: \`${purchaseId}\`\n` +
-                  `Product: **${product.name}**\n` +
-                  `Plan: **${PLAN_LABELS[planKey]}**\n` +
-                  `Reference: ${referenceCode ? `\`${referenceCode}\`` : "`none`"}\n` +
+                `Purchase ID: \`${purchaseId}\`
+` +
+                  `Product: **${product.name}**
+` +
+                  `Plan: **${PLAN_LABELS[planKey]}**
+` +
+                  `Reference: ${referenceCode ? `\`${referenceCode}\`` : "`none`"}
+` +
                   `Checkout: ${url}`
               )
               .setFooter({ text: BRAND_FOOTER })
               .setTimestamp(new Date()),
           ],
         });
-
         return interaction.reply({ content: "Checkout link posted in this ticket.", ephemeral: true });
       }
-
       // Refund approval buttons
       if (interaction.customId.startsWith("refund_approve:") || interaction.customId.startsWith("refund_reject:")) {
         if (interaction.user.id !== REFUND_APPROVER_USER_ID) {
           return interaction.reply({ content: "You are not allowed to approve/reject refunds.", ephemeral: true });
         }
-
         const [action, requestId] = interaction.customId.split(":");
         const reqDoc = await refundRequestsCol.findOne({ requestId, guildId: interaction.guild.id });
         if (!reqDoc) return interaction.reply({ content: "Refund request not found.", ephemeral: true });
         if (reqDoc.status !== "pending") return interaction.reply({ content: `Request already \`${reqDoc.status}\`.`, ephemeral: true });
-
         const originalEmbed = interaction.message.embeds?.[0];
         const base = originalEmbed ? EmbedBuilder.from(originalEmbed) : new EmbedBuilder().setColor(BRAND_COLOR);
-
         if (action === "refund_reject") {
           await refundRequestsCol.updateOne(
             { requestId },
             { $set: { status: "rejected", rejectedAt: new Date(), rejectedBy: interaction.user.id } }
           );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`rejected`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
+          base
+            .setFields(...fields, { name: "Status", value: "`rejected`", inline: true })
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp(new Date());
           return interaction.update({ embeds: [base], components: [] });
         }
-
         await interaction.deferUpdate();
-
         const purchase = await purchasesCol.findOne({ purchaseId: reqDoc.purchaseId, guildId: interaction.guild.id });
         if (!purchase) {
-          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "failed", failedAt: new Date(), failureReason: "Purchase not found" } });
+          await refundRequestsCol.updateOne(
+            { requestId },
+            { $set: { status: "failed", failedAt: new Date(), failureReason: "Purchase not found" } }
+          );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`failed (missing purchase)`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
-          await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
+          base
+            .setFields(...fields, { name: "Status", value: "`failed (missing purchase)`", inline: true })
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp(new Date());
+          await interaction.editReply({ embeds: [base], components: [] }).catch(() => {});
           return;
         }
-
         const paidAt = purchase.paidAt ? new Date(purchase.paidAt) : null;
         if (!paidAt || Date.now() - paidAt.getTime() > REFUND_WINDOW_MS) {
-          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "failed", failedAt: new Date(), failureReason: "Refund window expired" } });
+          await refundRequestsCol.updateOne(
+            { requestId },
+            { $set: { status: "failed", failedAt: new Date(), failureReason: "Refund window expired" } }
+          );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`failed (window expired)`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
-          await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
+          base
+            .setFields(...fields, { name: "Status", value: "`failed (window expired)`", inline: true })
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp(new Date());
+          await interaction.editReply({ embeds: [base], components: [] }).catch(() => {});
           return;
         }
-
         try {
-          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "approved", approvedAt: new Date(), approvedBy: interaction.user.id } });
+          await refundRequestsCol.updateOne(
+            { requestId },
+            { $set: { status: "approved", approvedAt: new Date(), approvedBy: interaction.user.id } }
+          );
           const refundId = await executeRefundInternal(purchase);
-
           if (purchase.type === "product" && purchase.roleId) {
             const member = await interaction.guild.members.fetch(purchase.userId).catch(() => null);
             if (member) await member.roles.remove(purchase.roleId, `Refund approved (${requestId})`).catch(() => {});
           }
-
-          await purchasesCol.updateOne({ purchaseId: purchase.purchaseId }, { $set: { status: "refunded", refundedAt: new Date(), stripeRefundId: refundId } });
-          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "executed", executedAt: new Date() } });
-
+          await purchasesCol.updateOne(
+            { purchaseId: purchase.purchaseId },
+            { $set: { status: "refunded", refundedAt: new Date(), stripeRefundId: refundId } }
+          );
+          await refundRequestsCol.updateOne(
+            { requestId },
+            { $set: { status: "executed", executedAt: new Date() } }
+          );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`refunded`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
-          await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
+          base
+            .setFields(...fields, { name: "Status", value: "`refunded`", inline: true })
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp(new Date());
+          await interaction.editReply({ embeds: [base], components: [] }).catch(() => {});
         } catch (e) {
           console.error("Refund execution failed:", e);
-          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "failed", failedAt: new Date(), failureReason: String(e.message || e).slice(0, 200) } });
+          await refundRequestsCol.updateOne(
+            { requestId },
+            { $set: { status: "failed", failedAt: new Date(), failureReason: String(e.message || e).slice(0, 200) } }
+          );
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base.setFields(...fields, { name: "Status", value: "`failed`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
-          await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
+          base
+            .setFields(...fields, { name: "Status", value: "`failed`", inline: true })
+            .setFooter({ text: BRAND_FOOTER })
+            .setTimestamp(new Date());
+          await interaction.editReply({ embeds: [base], components: [] }).catch(() => {});
         }
       }
     }
@@ -1186,7 +1118,6 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 });
-
 // ===================== READY =====================
 client.on("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
@@ -1195,15 +1126,8 @@ client.on("ready", async () => {
   await ensurePurchaseLogChannel(guild).catch(() => {});
   await upsertTicketPanel(guild).catch(() => {});
 });
-
-// ===================== WEB SERVER =====================
+// ===================== WEB SERVER (Stripe Webhook) =====================
 const app = express();
-
-// Render wants something listening NOW, so give it something.
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
-
-// Stripe webhook must be raw body
 app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   let event;
   try {
@@ -1212,34 +1136,28 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
     console.error("❌ Webhook signature failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-
   try {
+    // ---- checkout.session.completed ----
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       const meta = session.metadata || {};
-
       const purchaseId = meta.purchase_id;
       const guildId = meta.guild_id;
       const userId = meta.user_id;
       const type = meta.type;
-
       if (!purchaseId || !guildId || !userId || !type) return res.json({ received: true });
       if (guildId !== ALLOWED_GUILD_ID) return res.json({ received: true });
-
       const paymentIntentId = session.payment_intent || null;
       const subscriptionId = session.subscription || null;
-
       let currentPeriodEnd = null;
       let subscriptionStatus = null;
       let cancelAtPeriodEnd = null;
-
       if (subscriptionId) {
         const sub = await stripe.subscriptions.retrieve(subscriptionId);
         currentPeriodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
         subscriptionStatus = sub.status;
         cancelAtPeriodEnd = !!sub.cancel_at_period_end;
       }
-
       const updated = await purchasesCol.findOneAndUpdate(
         { purchaseId, stripeSessionId: session.id },
         {
@@ -1255,7 +1173,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         },
         { returnDocument: "after" }
       );
-
+      // fallback if purchase record missing
       if (!updated.value) {
         await purchasesCol.updateOne(
           { stripeSessionId: session.id },
@@ -1284,10 +1202,9 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
           { upsert: true }
         );
       }
-
       const guild = await client.guilds.fetch(guildId).catch(() => null);
       if (!guild) return res.json({ received: true });
-
+      // Grant role for product purchases
       if (type === "product" && meta.role_id) {
         try {
           const member = await guild.members.fetch(userId);
@@ -1296,10 +1213,9 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
           console.error("Role grant failed:", e);
         }
       }
-
+      // Purchase log (no Stripe IDs)
       const amountMinor = Number(meta.amount_minor || 0) || 0;
       const planKey = meta.plan_key || null;
-
       const logEmbed = new EmbedBuilder()
         .setColor(BRAND_COLOR)
         .setTitle(`${BRAND_NAME} • Purchase Completed`)
@@ -1313,25 +1229,30 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         )
         .setFooter({ text: BRAND_FOOTER })
         .setTimestamp(new Date());
-
       await logToPurchaseLog(guild, logEmbed);
-
-      if (type === "product") await sendThanksIfConfigured(guild, userId, purchaseId);
-
+      // Thanks channel (product only)
+      if (type === "product") {
+        await sendThanksIfConfigured(guild, userId, purchaseId);
+      }
+      // Reference usage log update (log instantly when set, then update on paid amount)
       const ref = (meta.reference_code || "none").toLowerCase();
       const isValidRef = VALID_REFERENCE_CODES.has(ref);
-
       if (isValidRef) {
+        // prevent duplicate "paid update" work on webhook retries
         const purchaseDoc = await purchasesCol.findOne({ purchaseId, guildId });
         if (purchaseDoc && !purchaseDoc.referencePaidUpdatedAt) {
           const refCh = await getReferenceLogChannel(guild);
+          // find a matching ticket log message (preferred), otherwise send a fresh paid log
           const ticket = await ticketsCol.findOne(
-            { guildId, userId, referenceCode: ref, referenceLogMessageId: { $exists: true, $ne: null } },
+            {
+              guildId,
+              userId,
+              referenceCode: ref,
+              referenceLogMessageId: { $exists: true, $ne: null },
+            },
             { sort: { referenceLoggedAt: -1 } }
           );
-
           let updatedLog = false;
-
           if (refCh && ticket?.referenceLogMessageId) {
             const msg = await refCh.messages.fetch(ticket.referenceLogMessageId).catch(() => null);
             if (msg) {
@@ -1349,17 +1270,35 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
                 )
                 .setFooter({ text: BRAND_FOOTER })
                 .setTimestamp(new Date());
-
               await msg.edit({ embeds: [paidEmbed] }).catch(() => {});
               updatedLog = true;
-
               await ticketsCol.updateOne(
                 { _id: ticket._id },
-                { $set: { referencePaidUpdatedAt: new Date(), lastPaidAmountMinor: amountMinor || null, lastPurchaseId: purchaseId } }
+                {
+                  $set: {
+                    referencePaidUpdatedAt: new Date(),
+                    lastPaidAmountMinor: amountMinor || null,
+                    lastPurchaseId: purchaseId,
+                  },
+                }
               );
+              // also update the ticket panel embed to show code + last paid amount
+              try {
+                const ch = await guild.channels.fetch(ticket.channelId).catch(() => null);
+                if (ch && ch.type === ChannelType.GuildText && ticket.ticketPanelMessageId && ticket.ticketProductId) {
+                  const product = await productsCol.findOne({ _id: new ObjectId(ticket.ticketProductId), guildId });
+                  const freshTicket = await ticketsCol.findOne({ _id: ticket._id });
+                  const panelMsg = await ch.messages.fetch(ticket.ticketPanelMessageId).catch(() => null);
+                  if (panelMsg && product && freshTicket) {
+                    const newEmbed = buildTicketEmbed({ userId, product, ticketDoc: freshTicket });
+                    await panelMsg.edit({ embeds: [newEmbed] }).catch(() => {});
+                  }
+                }
+              } catch {
+                // ignore
+              }
             }
           }
-
           if (refCh && !updatedLog) {
             const refEmbed = new EmbedBuilder()
               .setColor(BRAND_COLOR)
@@ -1368,21 +1307,23 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
                 { name: "Code", value: `\`${ref}\``, inline: true },
                 { name: "User", value: `<@${userId}>`, inline: true },
                 { name: "Spent", value: amountMinor ? minorToDisplay(amountMinor) : "n/a", inline: true },
-                { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true }
+                { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true },
+                ...(meta.product_name ? [{ name: "Product", value: meta.product_name, inline: false }] : []),
+                ...(planKey ? [{ name: "Plan", value: PLAN_LABELS[planKey] || planKey, inline: true }] : [])
               )
               .setFooter({ text: BRAND_FOOTER })
               .setTimestamp(new Date());
-
             await refCh.send({ embeds: [refEmbed] }).catch(() => {});
           }
-
-          await purchasesCol.updateOne({ purchaseId, guildId }, { $set: { referencePaidUpdatedAt: new Date() } });
+          await purchasesCol.updateOne(
+            { purchaseId, guildId },
+            { $set: { referencePaidUpdatedAt: new Date() } }
+          );
         }
       }
-
       return res.json({ received: true });
     }
-
+    // ---- customer.subscription.updated ----
     if (event.type === "customer.subscription.updated") {
       const sub = event.data.object;
       await purchasesCol.updateMany(
@@ -1398,15 +1339,13 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
       );
       return res.json({ received: true });
     }
-
+    // ---- customer.subscription.deleted ----
     if (event.type === "customer.subscription.deleted") {
       const sub = event.data.object;
-
       const purchase = await purchasesCol.findOne(
         { stripeSubscriptionId: sub.id, status: "paid", type: "product" },
         { sort: { paidAt: -1 } }
       );
-
       if (purchase) {
         const guild = await client.guilds.fetch(purchase.guildId).catch(() => null);
         if (guild) {
@@ -1416,66 +1355,42 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
           } catch (e) {
             console.error("Role removal failed:", e);
           }
-
           const embed = new EmbedBuilder()
             .setColor(BRAND_COLOR)
             .setTitle(`${BRAND_NAME} • Subscription Ended`)
             .addFields(
               { name: "User", value: `<@${purchase.userId}>`, inline: true },
-              { name: "Purchase ID", value: `\`${purchase.purchaseId}\``, inline: true }
+              { name: "Purchase ID", value: `\`${purchase.purchaseId}\``, inline: true },
+              { name: "Role removed", value: purchase.roleId ? `<@&${purchase.roleId}>` : "n/a", inline: false }
             )
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
-
           await logToPurchaseLog(guild, embed);
         }
       }
-
       await purchasesCol.updateMany(
         { stripeSubscriptionId: sub.id, status: "paid" },
         { $set: { subscriptionStatus: "canceled", subscriptionEndedAt: new Date() } }
       );
-
       return res.json({ received: true });
     }
-
     return res.json({ received: true });
   } catch (err) {
     console.error("Webhook handler error:", err);
     return res.status(500).send("Webhook handler failed");
   }
 });
-
 app.get("/success", (req, res) => res.status(200).send("Payment successful. You can close this tab."));
 app.get("/cancel", (req, res) => res.status(200).send("Payment canceled."));
-
 // ===================== START =====================
-process.on("unhandledRejection", (reason) => console.error("⚠️ unhandledRejection:", reason));
-process.on("uncaughtException", (err) => console.error("🔥 uncaughtException:", err));
-
-// ✅ CRITICAL RENDER FIX: bind PORT immediately
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🌐 Web server listening on 0.0.0.0:${PORT}`);
-});
-
-// Then do slow startup AFTER port is open
 (async () => {
-  try {
-    await initDb();
-  } catch (e) {
-    console.error("❌ Mongo init failed:", e);
-    // keep server alive so Render doesn't kill it
-  }
-
+  await initDb();
+  // If command registration fails (permissions etc.), don't crash the whole bot.
   try {
     await registerCommands();
   } catch (e) {
-    console.error("❌ Command registration failed:", e);
+    console.error("Command registration failed:", e);
   }
-
-  try {
-    await client.login(DISCORD_TOKEN);
-  } catch (e) {
-    console.error("❌ Discord login failed:", e);
-  }
+  await client.login(DISCORD_TOKEN);
+  app.listen(PORT, "0.0.0.0", () => console.log(`🌐 Web server on :${PORT}`));
 })();
