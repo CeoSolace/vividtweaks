@@ -129,20 +129,13 @@ async function initDb() {
   await ticketsCol.createIndex({ guildId: 1, userId: 1, status: 1 });
   await ticketsCol.createIndex({ guildId: 1, userId: 1, createdAt: -1 });
 
-  // ----- FIX: unique index on (guildId, channelId) must not include null -----
-  // Old code created a unique index that collides when channelId is null.
-  // We'll drop the old one (if exists) then create a partial unique index.
+  // FIX: unique index must not include null channelId
   try {
     await ticketsCol.dropIndex("guildId_1_channelId_1");
-  } catch {
-    // ignore (not existing)
-  }
+  } catch {}
   await ticketsCol.createIndex(
     { guildId: 1, channelId: 1 },
-    {
-      unique: true,
-      partialFilterExpression: { channelId: { $type: "string" } },
-    }
+    { unique: true, partialFilterExpression: { channelId: { $type: "string" } } }
   );
 
   console.log("✅ MongoDB connected");
@@ -154,16 +147,12 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 function ensureAllowedGuild(interaction) {
   if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) {
     interaction
-      .reply({
-        content: "This bot is locked to one server. Not this one.",
-        ephemeral: true,
-      })
+      .reply({ content: "This bot is locked to one server. Not this one.", ephemeral: true })
       .catch(() => {});
     return false;
   }
   return true;
 }
-
 function isAdmin(interaction) {
   const member = interaction.member;
   return (
@@ -171,7 +160,6 @@ function isAdmin(interaction) {
     new PermissionsBitField(member.permissions).has(PermissionsBitField.Flags.Administrator)
   );
 }
-
 function requireAdmin(interaction) {
   if (!isAdmin(interaction)) {
     interaction.reply({ content: "Administrator permission required.", ephemeral: true }).catch(() => {});
@@ -195,9 +183,7 @@ async function upsertConfig(guildId, patch) {
 // ===================== PRODUCT HELPERS =====================
 function enabledPlans(pricesObj) {
   const out = [];
-  for (const key of PLAN_KEYS) {
-    if (pricesObj?.[key]?.amountMinor) out.push(key);
-  }
+  for (const key of PLAN_KEYS) if (pricesObj?.[key]?.amountMinor) out.push(key);
   return out;
 }
 function formatPlans(pricesObj) {
@@ -232,7 +218,6 @@ function ticketUtilityButtons() {
 
 // ===================== CHANNEL HELPERS =====================
 async function ensurePurchaseLogChannel(guild) {
-  // FIX: ensure cache is populated
   await guild.channels.fetch().catch(() => {});
 
   const cfg = await getConfig(guild.id);
@@ -256,26 +241,21 @@ async function ensurePurchaseLogChannel(guild) {
       { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
     ],
   });
-
   await upsertConfig(guild.id, { purchaseLogChannelId: created.id });
   return created;
 }
-
 async function logToPurchaseLog(guild, embed, components = []) {
   const ch = await ensurePurchaseLogChannel(guild);
   await ch.send({ embeds: [embed], components }).catch(() => {});
 }
-
 async function getReferenceLogChannel(guild) {
   const ch = await guild.channels.fetch(REFERENCE_LOG_CHANNEL_ID).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return null;
   return ch;
 }
-
 async function sendThanksIfConfigured(guild, userId, purchaseId) {
   const cfg = await getConfig(guild.id);
   if (!cfg?.thanksChannelId) return;
-
   const ch = await guild.channels.fetch(cfg.thanksChannelId).catch(() => null);
   if (!ch || ch.type !== ChannelType.GuildText) return;
 
@@ -291,18 +271,12 @@ async function sendThanksIfConfigured(guild, userId, purchaseId) {
 
 // ===================== TICKETS =====================
 async function ensureTicketsCategory(guild) {
-  // FIX: ensure cache is populated
   await guild.channels.fetch().catch(() => {});
-
   const existing = guild.channels.cache.find(
     (c) => c.type === ChannelType.GuildCategory && c.name === "vivid-tickets"
   );
   if (existing) return existing;
-
-  return guild.channels.create({
-    name: "vivid-tickets",
-    type: ChannelType.GuildCategory,
-  });
+  return guild.channels.create({ name: "vivid-tickets", type: ChannelType.GuildCategory });
 }
 
 function buildTicketEmbed({ userId, product, ticketDoc }) {
@@ -310,7 +284,6 @@ function buildTicketEmbed({ userId, product, ticketDoc }) {
   const paidInfo = ticketDoc?.lastPaidAmountMinor
     ? `\nLast Payment: **${minorToDisplay(ticketDoc.lastPaidAmountMinor)}**`
     : "";
-
   return new EmbedBuilder()
     .setColor(BRAND_COLOR)
     .setTitle(`${BRAND_NAME} • Purchase Ticket`)
@@ -331,14 +304,12 @@ async function createOrGetTicketChannel(guild, userId) {
   if (existing?.channelId) {
     const ch = await guild.channels.fetch(existing.channelId).catch(() => null);
     if (ch && ch.type === ChannelType.GuildText) return ch;
-
     await ticketsCol.updateOne(
       { guildId: guild.id, userId, status: "open" },
       { $set: { status: "stale", staleAt: new Date() } }
     );
   }
 
-  // Prevent double creation
   const inFlight = await ticketsCol.findOne({ guildId: guild.id, userId, status: "creating" });
   if (inFlight?.channelId) {
     const ch = await guild.channels.fetch(inFlight.channelId).catch(() => null);
@@ -347,15 +318,12 @@ async function createOrGetTicketChannel(guild, userId) {
       return ch;
     }
   }
-  if (inFlight) {
-    await ticketsCol.deleteOne({ _id: inFlight._id }).catch(() => {});
-  }
+  if (inFlight) await ticketsCol.deleteOne({ _id: inFlight._id }).catch(() => {});
 
   const cfg = await getConfig(guild.id);
   const supportRoleId = cfg?.supportRoleId || null;
 
   const category = await ensureTicketsCategory(guild);
-
   const overwrites = [
     { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
     {
@@ -376,7 +344,6 @@ async function createOrGetTicketChannel(guild, userId) {
       ],
     },
   ];
-
   if (supportRoleId) {
     overwrites.push({
       id: supportRoleId,
@@ -388,7 +355,7 @@ async function createOrGetTicketChannel(guild, userId) {
     });
   }
 
-  // IMPORTANT FIX: do not set channelId: null (unique index would collide)
+  // FIX: do not set channelId:null
   const tempDoc = await ticketsCol.insertOne({
     guildId: guild.id,
     userId,
@@ -412,12 +379,7 @@ async function createOrGetTicketChannel(guild, userId) {
 
   await ticketsCol.updateOne(
     { _id: tempDoc.insertedId },
-    {
-      $set: {
-        channelId: ch.id,
-        status: "open",
-      },
-    }
+    { $set: { channelId: ch.id, status: "open" } }
   );
 
   return ch;
@@ -460,18 +422,14 @@ async function closeTicket(interaction, ticketDoc) {
     .setFooter({ text: BRAND_FOOTER })
     .setTimestamp(new Date());
 
-  // FIX: don’t bother sending into a channel you're deleting.
+  // FIX: log elsewhere, then delete
   await logToPurchaseLog(interaction.guild, embed).catch(() => {});
   await channel.delete().catch(() => {});
 }
 
 // ===================== TICKET PANEL =====================
 async function buildTicketPanelPayload(guildId) {
-  const products = await productsCol
-    .find({ guildId })
-    .sort({ createdAt: -1 })
-    .limit(25)
-    .toArray();
+  const products = await productsCol.find({ guildId }).sort({ createdAt: -1 }).limit(25).toArray();
 
   const embed = new EmbedBuilder()
     .setColor(BRAND_COLOR)
@@ -484,7 +442,6 @@ async function buildTicketPanelPayload(guildId) {
     .setFooter({ text: BRAND_FOOTER });
 
   const components = [];
-
   if (products.length) {
     const menu = new StringSelectMenuBuilder()
       .setCustomId("ticket_product_select")
@@ -518,9 +475,7 @@ async function upsertTicketPanel(guild) {
       const msg = await ch.messages.fetch(cfg.ticketPanelMessageId);
       await msg.edit(payload);
       return;
-    } catch {
-      // recreate
-    }
+    } catch {}
   }
 
   const msg = await ch.send(payload);
@@ -548,7 +503,6 @@ function makeLineItemForProduct(product, planKey) {
     quantity: 1,
   };
 }
-
 function makeLineItemForDonation(amountMinor) {
   return {
     price_data: {
@@ -708,9 +662,7 @@ const commands = [
     .setDescription("Set support role for ticket channels (optional)")
     .addRoleOption((o) => o.setName("role").setDescription("Support role").setRequired(true)),
 
-  new SlashCommandBuilder()
-    .setName("ticketpanel")
-    .setDescription("Repost/update the ticket panel in the fixed panel channel"),
+  new SlashCommandBuilder().setName("ticketpanel").setDescription("Repost/update the ticket panel in the fixed panel channel"),
 
   new SlashCommandBuilder()
     .setName("donate")
@@ -758,12 +710,9 @@ client.on("interactionCreate", async (interaction) => {
         for (const k of PLAN_KEYS) {
           if (!raw[k]) continue;
           const minor = amountToMinorUnits(raw[k]);
-          if (!minor) {
-            return interaction.reply({ content: `Invalid amount for ${k}: "${raw[k]}"`, ephemeral: true });
-          }
+          if (!minor) return interaction.reply({ content: `Invalid amount for ${k}: "${raw[k]}"`, ephemeral: true });
           prices[k] = { amountMinor: minor };
         }
-
         if (!enabledPlans(prices).length) {
           return interaction.reply({ content: "You must set at least one plan amount.", ephemeral: true });
         }
@@ -778,7 +727,6 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         await upsertTicketPanel(interaction.guild).catch(() => {});
-
         return interaction.reply({
           content: `Added **${name}** (ID: \`${doc.insertedId.toString()}\`) with plans: ${formatPlans(prices)}`,
           ephemeral: true,
@@ -802,7 +750,6 @@ client.on("interactionCreate", async (interaction) => {
         } else {
           const minor = amountToMinorUnits(amountRaw);
           if (!minor) return interaction.reply({ content: "Invalid amount format. Example: 9.99", ephemeral: true });
-
           await productsCol.updateOne(
             { _id: new ObjectId(productId) },
             { $set: { [`prices.${plan}`]: { amountMinor: minor } } }
@@ -816,12 +763,7 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "listproducts") {
         if (!requireAdmin(interaction)) return;
 
-        const products = await productsCol
-          .find({ guildId: interaction.guild.id })
-          .sort({ createdAt: -1 })
-          .limit(50)
-          .toArray();
-
+        const products = await productsCol.find({ guildId: interaction.guild.id }).sort({ createdAt: -1 }).limit(50).toArray();
         if (!products.length) return interaction.reply({ content: "No products.", ephemeral: true });
 
         const lines = products.map(
@@ -833,19 +775,16 @@ client.on("interactionCreate", async (interaction) => {
 
       if (interaction.commandName === "setthankschannel") {
         if (!requireAdmin(interaction)) return;
-
         const ch = interaction.options.getChannel("channel", true);
         if (!ch || ch.type !== ChannelType.GuildText) {
           return interaction.reply({ content: "Pick a normal text channel.", ephemeral: true });
         }
-
         await upsertConfig(interaction.guild.id, { thanksChannelId: ch.id });
         return interaction.reply({ content: `Thanks channel set to <#${ch.id}>`, ephemeral: true });
       }
 
       if (interaction.commandName === "setsupportrole") {
         if (!requireAdmin(interaction)) return;
-
         const role = interaction.options.getRole("role", true);
         await upsertConfig(interaction.guild.id, { supportRoleId: role.id });
         return interaction.reply({ content: `Support role set to <@&${role.id}>`, ephemeral: true });
@@ -860,7 +799,6 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "donate") {
         const amountRaw = interaction.options.getString("amount", true);
         const minor = amountToMinorUnits(amountRaw);
-
         if (!minor) return interaction.reply({ content: "Invalid amount. Example: 5 or 9.99", ephemeral: true });
         if (minor < 100) return interaction.reply({ content: "Minimum donation is £1.00", ephemeral: true });
 
@@ -878,27 +816,22 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      // /refund -> creates approval request (does not refund instantly)
+      // /refund -> approval request
       if (interaction.commandName === "refund") {
         if (!requireAdmin(interaction)) return;
 
         const purchaseId = interaction.options.getString("purchase_id", true).trim();
         const purchase = await purchasesCol.findOne({ purchaseId, guildId: interaction.guild.id });
-
         if (!purchase) return interaction.reply({ content: "Purchase not found.", ephemeral: true });
-        if (purchase.status !== "paid") {
-          return interaction.reply({ content: `Purchase status is \`${purchase.status}\`.`, ephemeral: true });
-        }
+        if (purchase.status !== "paid") return interaction.reply({ content: `Purchase status is \`${purchase.status}\`.`, ephemeral: true });
 
         const paidAt = purchase.paidAt ? new Date(purchase.paidAt) : null;
         if (!paidAt) return interaction.reply({ content: "No paidAt recorded. Can't refund safely.", ephemeral: true });
-
         if (Date.now() - paidAt.getTime() > REFUND_WINDOW_MS) {
           return interaction.reply({ content: "Refund window expired (over 24 hours).", ephemeral: true });
         }
 
         const requestId = makeRefundRequestId();
-
         await refundRequestsCol.insertOne({
           requestId,
           purchaseId,
@@ -996,44 +929,33 @@ client.on("interactionCreate", async (interaction) => {
           .setTimestamp(new Date());
 
         await logToPurchaseLog(interaction.guild, embed);
-
         return interaction.editReply("Subscription canceled. You keep access until the end of your billing period.");
       }
     }
 
-    // ---------- Ticket dropdown ----------
+    // Ticket dropdown
     if (interaction.isStringSelectMenu()) {
       if (!ensureAllowedGuild(interaction)) return;
 
       if (interaction.customId === "ticket_product_select") {
         const productId = interaction.values[0];
-        if (!ObjectId.isValid(productId)) {
-          return interaction.reply({ content: "Invalid product selection.", ephemeral: true });
-        }
+        if (!ObjectId.isValid(productId)) return interaction.reply({ content: "Invalid product selection.", ephemeral: true });
 
         const product = await productsCol.findOne({ _id: new ObjectId(productId), guildId: interaction.guild.id });
         if (!product) return interaction.reply({ content: "Product not found.", ephemeral: true });
-        if (!enabledPlans(product.prices).length) {
-          return interaction.reply({ content: "No plans enabled for that product.", ephemeral: true });
-        }
+        if (!enabledPlans(product.prices).length) return interaction.reply({ content: "No plans enabled for that product.", ephemeral: true });
 
         const ticketCh = await createOrGetTicketChannel(interaction.guild, interaction.user.id);
-        const ticketDoc = await ticketsCol.findOne({
-          guildId: interaction.guild.id,
-          channelId: ticketCh.id,
-          status: "open",
-        });
+        const ticketDoc = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: ticketCh.id, status: "open" });
 
         const embed = buildTicketEmbed({ userId: interaction.user.id, product, ticketDoc });
         const components = [...ticketUtilityButtons(), ...ticketPlanButtons(product)];
 
-        const msg = await ticketCh
-          .send({
-            content: `<@${interaction.user.id}>`,
-            embeds: [embed],
-            components,
-          })
-          .catch(() => null);
+        const msg = await ticketCh.send({
+          content: `<@${interaction.user.id}>`,
+          embeds: [embed],
+          components,
+        }).catch(() => null);
 
         if (msg?.id) {
           await ticketsCol.updateOne(
@@ -1046,37 +968,27 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
-    // ---------- Modals ----------
+    // Modals
     if (interaction.isModalSubmit()) {
       if (!ensureAllowedGuild(interaction)) return;
 
       if (interaction.customId.startsWith("refmodal:")) {
         const channelId = interaction.customId.split(":")[1];
-
-        if (interaction.channelId !== channelId) {
-          return interaction.reply({ content: "Wrong channel for that modal.", ephemeral: true });
-        }
+        if (interaction.channelId !== channelId) return interaction.reply({ content: "Wrong channel for that modal.", ephemeral: true });
 
         const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid open ticket.", ephemeral: true });
-
-        if (ticket.userId !== interaction.user.id) {
-          return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
-        }
+        if (ticket.userId !== interaction.user.id) return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
 
         const entered = interaction.fields.getTextInputValue("refcode").trim().toLowerCase();
-        if (!VALID_REFERENCE_CODES.has(entered)) {
-          return interaction.reply({ content: "Invalid reference code.", ephemeral: true });
-        }
+        if (!VALID_REFERENCE_CODES.has(entered)) return interaction.reply({ content: "Invalid reference code.", ephemeral: true });
 
         await ticketsCol.updateOne(
           { guildId: interaction.guild.id, channelId, status: "open" },
           { $set: { referenceCode: entered, referenceSetAt: new Date() } }
         );
 
-        const guild = interaction.guild;
-        const refCh = await getReferenceLogChannel(guild);
-
+        const refCh = await getReferenceLogChannel(interaction.guild);
         let logMsgId = ticket.referenceLogMessageId || null;
 
         if (refCh && !logMsgId) {
@@ -1094,25 +1006,20 @@ client.on("interactionCreate", async (interaction) => {
             .setTimestamp(new Date());
 
           const sent = await refCh.send({ embeds: [pendingEmbed] }).catch(() => null);
-
           if (sent?.id) {
             logMsgId = sent.id;
             await ticketsCol.updateOne(
-              { guildId: guild.id, channelId, status: "open" },
+              { guildId: interaction.guild.id, channelId, status: "open" },
               { $set: { referenceLogMessageId: logMsgId, referenceLoggedAt: new Date() } }
             );
           }
         }
 
-        // Update ticket panel embed so it shows their code immediately
+        // update ticket panel message to show the ref
         try {
           const freshTicket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
           if (freshTicket?.ticketPanelMessageId && freshTicket?.ticketProductId) {
-            const product = await productsCol.findOne({
-              _id: new ObjectId(freshTicket.ticketProductId),
-              guildId: interaction.guild.id,
-            });
-
+            const product = await productsCol.findOne({ _id: new ObjectId(freshTicket.ticketProductId), guildId: interaction.guild.id });
             const ch = await interaction.guild.channels.fetch(channelId).catch(() => null);
             if (ch && ch.type === ChannelType.GuildText && product) {
               const msg = await ch.messages.fetch(freshTicket.ticketPanelMessageId).catch(() => null);
@@ -1122,54 +1029,31 @@ client.on("interactionCreate", async (interaction) => {
               }
             }
           }
-        } catch {
-          // ignore
-        }
+        } catch {}
 
         return interaction.reply({ content: `✅ Reference code set: \`${entered}\``, ephemeral: true });
       }
     }
 
-    // ---------- Buttons ----------
+    // Buttons
     if (interaction.isButton()) {
       if (!ensureAllowedGuild(interaction)) return;
 
-      // Close ticket button
       if (interaction.customId === "ticket:close") {
-        const ticket = await ticketsCol.findOne({
-          guildId: interaction.guild.id,
-          channelId: interaction.channelId,
-          status: "open",
-        });
-
-        if (!ticket) {
-          return interaction.reply({ content: "This isn’t a valid open purchase ticket channel.", ephemeral: true });
-        }
-
+        const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
+        if (!ticket) return interaction.reply({ content: "This isn’t a valid open purchase ticket channel.", ephemeral: true });
         const allowed = await canManageTicket(interaction, ticket);
         if (!allowed) return interaction.reply({ content: "You don’t have permission to close this ticket.", ephemeral: true });
-
         await closeTicket(interaction, ticket);
         return interaction.reply({ content: "Ticket closed.", ephemeral: true });
       }
 
-      // Add reference code button
       if (interaction.customId === "ref:add") {
-        const ticket = await ticketsCol.findOne({
-          guildId: interaction.guild.id,
-          channelId: interaction.channelId,
-          status: "open",
-        });
-
+        const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid purchase ticket channel.", ephemeral: true });
-        if (ticket.userId !== interaction.user.id) {
-          return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
-        }
+        if (ticket.userId !== interaction.user.id) return interaction.reply({ content: "Only the ticket owner can set a reference code.", ephemeral: true });
 
-        const modal = new ModalBuilder()
-          .setCustomId(`refmodal:${interaction.channelId}`)
-          .setTitle(`${BRAND_NAME} • Reference Code`);
-
+        const modal = new ModalBuilder().setCustomId(`refmodal:${interaction.channelId}`).setTitle(`${BRAND_NAME} • Reference Code`);
         const input = new TextInputBuilder()
           .setCustomId("refcode")
           .setLabel("Enter reference code")
@@ -1182,33 +1066,20 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // Ticket plan buttons -> generate checkout link in ticket
       if (interaction.customId.startsWith("tp:")) {
         const [, productId, planKey] = interaction.customId.split(":");
-
         if (!ObjectId.isValid(productId)) return interaction.reply({ content: "Invalid product.", ephemeral: true });
         if (!PLAN_KEYS.includes(planKey)) return interaction.reply({ content: "Invalid plan.", ephemeral: true });
 
-        const ticket = await ticketsCol.findOne({
-          guildId: interaction.guild.id,
-          channelId: interaction.channelId,
-          status: "open",
-        });
-
+        const ticket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId: interaction.channelId, status: "open" });
         if (!ticket) return interaction.reply({ content: "This isn’t a valid purchase ticket channel.", ephemeral: true });
-        if (interaction.user.id !== ticket.userId) {
-          return interaction.reply({ content: "Only the ticket owner can generate checkout links.", ephemeral: true });
-        }
+        if (interaction.user.id !== ticket.userId) return interaction.reply({ content: "Only the ticket owner can generate checkout links.", ephemeral: true });
 
         const product = await productsCol.findOne({ _id: new ObjectId(productId), guildId: interaction.guild.id });
         if (!product) return interaction.reply({ content: "Product not found.", ephemeral: true });
-        if (!product.prices?.[planKey]?.amountMinor) {
-          return interaction.reply({ content: "That plan is not available.", ephemeral: true });
-        }
+        if (!product.prices?.[planKey]?.amountMinor) return interaction.reply({ content: "That plan is not available.", ephemeral: true });
 
-        const referenceCode =
-          ticket.referenceCode && VALID_REFERENCE_CODES.has(ticket.referenceCode) ? ticket.referenceCode : null;
-
+        const referenceCode = ticket.referenceCode && VALID_REFERENCE_CODES.has(ticket.referenceCode) ? ticket.referenceCode : null;
         const purchaseId = makePurchaseId();
 
         const url = await createCheckoutSessionForProduct({
@@ -1248,76 +1119,44 @@ client.on("interactionCreate", async (interaction) => {
 
         const [action, requestId] = interaction.customId.split(":");
         const reqDoc = await refundRequestsCol.findOne({ requestId, guildId: interaction.guild.id });
-
         if (!reqDoc) return interaction.reply({ content: "Refund request not found.", ephemeral: true });
-        if (reqDoc.status !== "pending") {
-          return interaction.reply({ content: `Request already \`${reqDoc.status}\`.`, ephemeral: true });
-        }
+        if (reqDoc.status !== "pending") return interaction.reply({ content: `Request already \`${reqDoc.status}\`.`, ephemeral: true });
 
         const originalEmbed = interaction.message.embeds?.[0];
         const base = originalEmbed ? EmbedBuilder.from(originalEmbed) : new EmbedBuilder().setColor(BRAND_COLOR);
 
-        // Reject
         if (action === "refund_reject") {
           await refundRequestsCol.updateOne(
             { requestId },
             { $set: { status: "rejected", rejectedAt: new Date(), rejectedBy: interaction.user.id } }
           );
-
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base
-            .setFields(...fields, { name: "Status", value: "`rejected`", inline: true })
-            .setFooter({ text: BRAND_FOOTER })
-            .setTimestamp(new Date());
-
+          base.setFields(...fields, { name: "Status", value: "`rejected`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
           return interaction.update({ embeds: [base], components: [] });
         }
 
-        // Approve
         await interaction.deferUpdate();
 
         const purchase = await purchasesCol.findOne({ purchaseId: reqDoc.purchaseId, guildId: interaction.guild.id });
-
         if (!purchase) {
-          await refundRequestsCol.updateOne(
-            { requestId },
-            { $set: { status: "failed", failedAt: new Date(), failureReason: "Purchase not found" } }
-          );
-
+          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "failed", failedAt: new Date(), failureReason: "Purchase not found" } });
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base
-            .setFields(...fields, { name: "Status", value: "`failed (missing purchase)`", inline: true })
-            .setFooter({ text: BRAND_FOOTER })
-            .setTimestamp(new Date());
-
-          // FIX: edit the clicked message, not some phantom interaction reply
+          base.setFields(...fields, { name: "Status", value: "`failed (missing purchase)`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
           await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
           return;
         }
 
         const paidAt = purchase.paidAt ? new Date(purchase.paidAt) : null;
         if (!paidAt || Date.now() - paidAt.getTime() > REFUND_WINDOW_MS) {
-          await refundRequestsCol.updateOne(
-            { requestId },
-            { $set: { status: "failed", failedAt: new Date(), failureReason: "Refund window expired" } }
-          );
-
+          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "failed", failedAt: new Date(), failureReason: "Refund window expired" } });
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base
-            .setFields(...fields, { name: "Status", value: "`failed (window expired)`", inline: true })
-            .setFooter({ text: BRAND_FOOTER })
-            .setTimestamp(new Date());
-
+          base.setFields(...fields, { name: "Status", value: "`failed (window expired)`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
           await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
           return;
         }
 
         try {
-          await refundRequestsCol.updateOne(
-            { requestId },
-            { $set: { status: "approved", approvedAt: new Date(), approvedBy: interaction.user.id } }
-          );
-
+          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "approved", approvedAt: new Date(), approvedBy: interaction.user.id } });
           const refundId = await executeRefundInternal(purchase);
 
           if (purchase.type === "product" && purchase.roleId) {
@@ -1325,37 +1164,17 @@ client.on("interactionCreate", async (interaction) => {
             if (member) await member.roles.remove(purchase.roleId, `Refund approved (${requestId})`).catch(() => {});
           }
 
-          await purchasesCol.updateOne(
-            { purchaseId: purchase.purchaseId },
-            { $set: { status: "refunded", refundedAt: new Date(), stripeRefundId: refundId } }
-          );
-
-          await refundRequestsCol.updateOne(
-            { requestId },
-            { $set: { status: "executed", executedAt: new Date() } }
-          );
+          await purchasesCol.updateOne({ purchaseId: purchase.purchaseId }, { $set: { status: "refunded", refundedAt: new Date(), stripeRefundId: refundId } });
+          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "executed", executedAt: new Date() } });
 
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base
-            .setFields(...fields, { name: "Status", value: "`refunded`", inline: true })
-            .setFooter({ text: BRAND_FOOTER })
-            .setTimestamp(new Date());
-
+          base.setFields(...fields, { name: "Status", value: "`refunded`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
           await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
         } catch (e) {
           console.error("Refund execution failed:", e);
-
-          await refundRequestsCol.updateOne(
-            { requestId },
-            { $set: { status: "failed", failedAt: new Date(), failureReason: String(e.message || e).slice(0, 200) } }
-          );
-
+          await refundRequestsCol.updateOne({ requestId }, { $set: { status: "failed", failedAt: new Date(), failureReason: String(e.message || e).slice(0, 200) } });
           const fields = (originalEmbed?.fields || []).filter((f) => f.name !== "Status");
-          base
-            .setFields(...fields, { name: "Status", value: "`failed`", inline: true })
-            .setFooter({ text: BRAND_FOOTER })
-            .setTimestamp(new Date());
-
+          base.setFields(...fields, { name: "Status", value: "`failed`", inline: true }).setFooter({ text: BRAND_FOOTER }).setTimestamp(new Date());
           await interaction.message.edit({ embeds: [base], components: [] }).catch(() => {});
         }
       }
@@ -1371,21 +1190,20 @@ client.on("interactionCreate", async (interaction) => {
 // ===================== READY =====================
 client.on("ready", async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
-
   const guild = await client.guilds.fetch(ALLOWED_GUILD_ID).catch(() => null);
   if (!guild) return;
-
   await ensurePurchaseLogChannel(guild).catch(() => {});
   await upsertTicketPanel(guild).catch(() => {});
 });
 
-// ===================== WEB SERVER (Stripe Webhook) =====================
+// ===================== WEB SERVER =====================
 const app = express();
 
-// Health check so hosts stop panicking
+// Render wants something listening NOW, so give it something.
+app.get("/", (req, res) => res.status(200).send("ok"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-// Stripe webhook must use raw body
+// Stripe webhook must be raw body
 app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
   let event;
   try {
@@ -1396,7 +1214,6 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
   }
 
   try {
-    // ---- checkout.session.completed ----
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       const meta = session.metadata || {};
@@ -1439,7 +1256,6 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         { returnDocument: "after" }
       );
 
-      // fallback if purchase record missing
       if (!updated.value) {
         await purchasesCol.updateOne(
           { stripeSessionId: session.id },
@@ -1472,7 +1288,6 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
       const guild = await client.guilds.fetch(guildId).catch(() => null);
       if (!guild) return res.json({ received: true });
 
-      // Grant role for product purchases
       if (type === "product" && meta.role_id) {
         try {
           const member = await guild.members.fetch(userId);
@@ -1482,7 +1297,6 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         }
       }
 
-      // Purchase log (no Stripe IDs)
       const amountMinor = Number(meta.amount_minor || 0) || 0;
       const planKey = meta.plan_key || null;
 
@@ -1502,12 +1316,8 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
 
       await logToPurchaseLog(guild, logEmbed);
 
-      // Thanks channel (product only)
-      if (type === "product") {
-        await sendThanksIfConfigured(guild, userId, purchaseId);
-      }
+      if (type === "product") await sendThanksIfConfigured(guild, userId, purchaseId);
 
-      // Reference usage log update
       const ref = (meta.reference_code || "none").toLowerCase();
       const isValidRef = VALID_REFERENCE_CODES.has(ref);
 
@@ -1515,14 +1325,8 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
         const purchaseDoc = await purchasesCol.findOne({ purchaseId, guildId });
         if (purchaseDoc && !purchaseDoc.referencePaidUpdatedAt) {
           const refCh = await getReferenceLogChannel(guild);
-
           const ticket = await ticketsCol.findOne(
-            {
-              guildId,
-              userId,
-              referenceCode: ref,
-              referenceLogMessageId: { $exists: true, $ne: null },
-            },
+            { guildId, userId, referenceCode: ref, referenceLogMessageId: { $exists: true, $ne: null } },
             { sort: { referenceLoggedAt: -1 } }
           );
 
@@ -1551,31 +1355,8 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
 
               await ticketsCol.updateOne(
                 { _id: ticket._id },
-                {
-                  $set: {
-                    referencePaidUpdatedAt: new Date(),
-                    lastPaidAmountMinor: amountMinor || null,
-                    lastPurchaseId: purchaseId,
-                  },
-                }
+                { $set: { referencePaidUpdatedAt: new Date(), lastPaidAmountMinor: amountMinor || null, lastPurchaseId: purchaseId } }
               );
-
-              // Update the ticket panel embed too
-              try {
-                const ch = await guild.channels.fetch(ticket.channelId).catch(() => null);
-                if (ch && ch.type === ChannelType.GuildText && ticket.ticketPanelMessageId && ticket.ticketProductId) {
-                  const product = await productsCol.findOne({ _id: new ObjectId(ticket.ticketProductId), guildId });
-                  const freshTicket = await ticketsCol.findOne({ _id: ticket._id });
-
-                  const panelMsg = await ch.messages.fetch(ticket.ticketPanelMessageId).catch(() => null);
-                  if (panelMsg && product && freshTicket) {
-                    const newEmbed = buildTicketEmbed({ userId, product, ticketDoc: freshTicket });
-                    await panelMsg.edit({ embeds: [newEmbed] }).catch(() => {});
-                  }
-                }
-              } catch {
-                // ignore
-              }
             }
           }
 
@@ -1587,9 +1368,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
                 { name: "Code", value: `\`${ref}\``, inline: true },
                 { name: "User", value: `<@${userId}>`, inline: true },
                 { name: "Spent", value: amountMinor ? minorToDisplay(amountMinor) : "n/a", inline: true },
-                { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true },
-                ...(meta.product_name ? [{ name: "Product", value: meta.product_name, inline: false }] : []),
-                ...(planKey ? [{ name: "Plan", value: PLAN_LABELS[planKey] || planKey, inline: true }] : [])
+                { name: "Purchase ID", value: `\`${purchaseId}\``, inline: true }
               )
               .setFooter({ text: BRAND_FOOTER })
               .setTimestamp(new Date());
@@ -1604,7 +1383,6 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
       return res.json({ received: true });
     }
 
-    // ---- customer.subscription.updated ----
     if (event.type === "customer.subscription.updated") {
       const sub = event.data.object;
       await purchasesCol.updateMany(
@@ -1621,7 +1399,6 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
       return res.json({ received: true });
     }
 
-    // ---- customer.subscription.deleted ----
     if (event.type === "customer.subscription.deleted") {
       const sub = event.data.object;
 
@@ -1645,8 +1422,7 @@ app.post("/stripe/webhook", bodyParser.raw({ type: "application/json" }), async 
             .setTitle(`${BRAND_NAME} • Subscription Ended`)
             .addFields(
               { name: "User", value: `<@${purchase.userId}>`, inline: true },
-              { name: "Purchase ID", value: `\`${purchase.purchaseId}\``, inline: true },
-              { name: "Role removed", value: purchase.roleId ? `<@&${purchase.roleId}>` : "n/a", inline: false }
+              { name: "Purchase ID", value: `\`${purchase.purchaseId}\``, inline: true }
             )
             .setFooter({ text: BRAND_FOOTER })
             .setTimestamp(new Date());
@@ -1674,25 +1450,32 @@ app.get("/success", (req, res) => res.status(200).send("Payment successful. You 
 app.get("/cancel", (req, res) => res.status(200).send("Payment canceled."));
 
 // ===================== START =====================
-process.on("unhandledRejection", (reason) => {
-  console.error("⚠️ unhandledRejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("🔥 uncaughtException:", err);
+process.on("unhandledRejection", (reason) => console.error("⚠️ unhandledRejection:", reason));
+process.on("uncaughtException", (err) => console.error("🔥 uncaughtException:", err));
+
+// ✅ CRITICAL RENDER FIX: bind PORT immediately
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🌐 Web server listening on 0.0.0.0:${PORT}`);
 });
 
+// Then do slow startup AFTER port is open
 (async () => {
-  await initDb();
+  try {
+    await initDb();
+  } catch (e) {
+    console.error("❌ Mongo init failed:", e);
+    // keep server alive so Render doesn't kill it
+  }
 
   try {
     await registerCommands();
   } catch (e) {
-    console.error("Command registration failed:", e);
+    console.error("❌ Command registration failed:", e);
   }
 
-  await client.login(DISCORD_TOKEN);
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🌐 Web server listening on 0.0.0.0:${PORT}`);
-  });
+  try {
+    await client.login(DISCORD_TOKEN);
+  } catch (e) {
+    console.error("❌ Discord login failed:", e);
+  }
 })();
