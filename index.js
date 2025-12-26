@@ -22,10 +22,11 @@ const {
 const express = require("express");
 const Stripe = require("stripe");
 const { MongoClient, ObjectId } = require("mongodb");
+const discordTranscripts = require("discord-html-transcripts");
 
 // ===================== HARD LOCK =====================
 const ALLOWED_GUILD_ID = "1269702895549419544";
-const REFUND_APPROVER_USER_ID = "1400281740978815118";
+const REFUND_APPROVER_USER_ID = "1400281740978815118"; // (kept even if unused yet)
 const TICKET_PANEL_CHANNEL_ID = "1452386415814901924";
 const REFERENCE_LOG_CHANNEL_ID = "1452429835677728975";
 
@@ -65,6 +66,13 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const PORT = Number(process.env.PORT || 3000);
+
+// Optional transcript upload target
+const PASTEIT_URL = process.env.PASTEIT_URL || "";
+const PASTEIT_TOKEN = process.env.PASTEIT_TOKEN || "";
+
+// Optional: auto-delete closed tickets after N minutes (0 disables)
+const TICKET_AUTODELETE_MINUTES = Number(process.env.TICKET_AUTODELETE_MINUTES || 0);
 
 if (!DISCORD_TOKEN) throw new Error("Missing DISCORD_TOKEN");
 if (!CLIENT_ID) throw new Error("Missing DISCORD_CLIENT_ID");
@@ -121,6 +129,51 @@ function formatPlans(pricesObj) {
   return plans
     .map((k) => `\`${PLAN_LABELS[k]} ${minorToDisplay(pricesObj[k].amountMinor)}\``)
     .join(", ");
+}
+
+// --- transcript upload (PasteIt-style generic JSON) ---
+async function uploadTranscriptToPasteIt({ filename, content }) {
+  if (!PASTEIT_URL) return null;
+
+  try {
+    const res = await fetch(PASTEIT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(PASTEIT_TOKEN ? { Authorization: `Bearer ${PASTEIT_TOKEN}` } : {}),
+      },
+      body: JSON.stringify({
+        filename,
+        content,
+        contentType: "text/html",
+        private: true,
+      }),
+    });
+
+    if (!res.ok) return null;
+    const text = await res.text();
+
+    try {
+      const data = JSON.parse(text);
+      return data.url || data.link || data.result?.url || null;
+    } catch {
+      return text?.startsWith("http") ? text.trim() : null;
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function buildTicketTranscriptAttachment(channel) {
+  const filename = `transcript-${channel.id}.html`;
+  const attachment = await discordTranscripts.createTranscript(channel, {
+    limit: -1,
+    returnType: "attachment",
+    filename,
+    saveImages: true,
+    poweredBy: false,
+  });
+  return { attachment, filename };
 }
 
 // ===================== DB =====================
@@ -423,30 +476,115 @@ async function canManageTicket(interaction, ticketDoc) {
   return false;
 }
 
+function disableComponents(components) {
+  const out = [];
+  for (const row of components || []) {
+    const newRow = new ActionRowBuilder();
+    for (const comp of row.components || []) {
+      if (comp.type === 2) {
+        const b = ButtonBuilder.from(comp).setDisabled(true);
+        newRow.addComponents(b);
+      } else if (comp.type === 3) {
+        const m = StringSelectMenuBuilder.from(comp).setDisabled(true);
+        newRow.addComponents(m);
+      }
+    }
+    if (newRow.components.length) out.push(newRow);
+  }
+  return out;
+}
+
 async function closeTicket(interaction, ticketDoc) {
-  const channel = await interaction.guild.channels.fetch(ticketDoc.channelId).catch(() => null);
+  const guild = interaction.guild;
+
+  const channel = await guild.channels.fetch(ticketDoc.channelId).catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildText) return;
 
+  // prevent double close
+  const fresh = await ticketsCol.findOne({ guildId: guild.id, channelId: ticketDoc.channelId });
+  if (!fresh || fresh.status !== "open") {
+    return interaction.editReply("Ticket is already closed (or invalid).").catch(() => {});
+  }
+
+  // Disable the ticket panel message UI if we can
+  try {
+    if (fresh.ticketPanelMessageId) {
+      const msg = await channel.messages.fetch(fresh.ticketPanelMessageId).catch(() => null);
+      if (msg) {
+        await msg.edit({ components: disableComponents(msg.components) }).catch(() => {});
+      }
+    }
+  } catch {}
+
+  // Transcript
+  let transcriptUrl = null;
+  let transcriptAttachment = null;
+
+  try {
+    const { attachment, filename } = await buildTicketTranscriptAttachment(channel);
+
+    if (PASTEIT_URL) {
+      const htmlString = await discordTranscripts.createTranscript(channel, {
+        limit: -1,
+        returnType: "string",
+        saveImages: false,
+        poweredBy: false,
+      });
+      transcriptUrl = await uploadTranscriptToPasteIt({ filename, content: htmlString });
+    }
+
+    if (!transcriptUrl) transcriptAttachment = attachment;
+  } catch (e) {
+    console.error("Transcript build failed:", e);
+  }
+
+  // lock + rename
   await channel.permissionOverwrites.edit(ticketDoc.userId, { SendMessages: false }).catch(() => {});
   await channel.setName(`closed-${ticketDoc.userId}`.slice(0, 100)).catch(() => {});
 
+  // DB update
   await ticketsCol.updateOne(
-    { guildId: interaction.guild.id, channelId: ticketDoc.channelId, status: "open" },
+    { guildId: guild.id, channelId: ticketDoc.channelId, status: "open" },
     { $set: { status: "closed", closedAt: new Date(), closedBy: interaction.user.id } }
   );
 
-  const embed = new EmbedBuilder()
+  const closedEmbed = new EmbedBuilder()
     .setColor(BRAND_COLOR)
     .setTitle(`${BRAND_NAME} • Ticket Closed`)
     .setDescription(
       `Closed by: <@${interaction.user.id}>\n` +
         `Owner: <@${ticketDoc.userId}>\n` +
-        `Reference: ${ticketDoc.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`"}`
+        `Reference: ${ticketDoc.referenceCode ? `\`${ticketDoc.referenceCode}\`` : "`none`"}\n` +
+        `Transcript: ${transcriptUrl ? transcriptUrl : (transcriptAttachment ? "attached" : "`unavailable`")}`
     )
     .setFooter({ text: BRAND_FOOTER })
     .setTimestamp(new Date());
 
-  await channel.send({ embeds: [embed] }).catch(() => {});
+  await channel.send({ embeds: [closedEmbed] }).catch(() => {});
+
+  // log to purchase-log
+  const logEmbed = EmbedBuilder.from(closedEmbed).setTitle(`${BRAND_NAME} • Ticket Closed (Log)`);
+  if (transcriptUrl) {
+    await logToPurchaseLog(guild, logEmbed).catch(() => {});
+  } else if (transcriptAttachment) {
+    const logCh = await ensurePurchaseLogChannel(guild).catch(() => null);
+    if (logCh) await logCh.send({ embeds: [logEmbed], files: [transcriptAttachment] }).catch(() => {});
+  } else {
+    await logToPurchaseLog(guild, logEmbed).catch(() => {});
+  }
+
+  // optional auto-delete
+  if (TICKET_AUTODELETE_MINUTES > 0) {
+    setTimeout(async () => {
+      const ch = await guild.channels.fetch(ticketDoc.channelId).catch(() => null);
+      if (!ch) return;
+
+      const t = await ticketsCol.findOne({ guildId: guild.id, channelId: ticketDoc.channelId }).catch(() => null);
+      if (t?.status === "closed") {
+        await ch.delete(`Auto-deleted closed ticket after ${TICKET_AUTODELETE_MINUTES} minutes`).catch(() => {});
+      }
+    }, TICKET_AUTODELETE_MINUTES * 60 * 1000);
+  }
 }
 
 // ===================== TICKET PANEL =====================
@@ -844,7 +982,10 @@ client.on("interactionCreate", async (interaction) => {
           purchaseId,
         });
 
-        return interaction.reply({ content: `Donation Checkout link (Purchase ID: \`${purchaseId}\`):\n${url}`, ephemeral: true });
+        return interaction.reply({
+          content: `Donation Checkout link (Purchase ID: \`${purchaseId}\`):\n${url}`,
+          ephemeral: true
+        });
       }
 
       if (interaction.commandName === "refund") {
@@ -1049,6 +1190,7 @@ client.on("interactionCreate", async (interaction) => {
           }
         }
 
+        // Update ticket embed to show reference
         try {
           const freshTicket = await ticketsCol.findOne({ guildId: interaction.guild.id, channelId, status: "open" });
           if (freshTicket?.ticketPanelMessageId && freshTicket?.ticketProductId) {
@@ -1086,8 +1228,10 @@ client.on("interactionCreate", async (interaction) => {
         const allowed = await canManageTicket(interaction, ticket);
         if (!allowed) return interaction.reply({ content: "You don’t have permission to close this ticket.", ephemeral: true });
 
+        // Faster: defer immediately so transcript generation doesn't cause interaction timeout
+        await interaction.deferReply({ ephemeral: true }).catch(() => {});
         await closeTicket(interaction, ticket);
-        return interaction.reply({ content: "Ticket closed.", ephemeral: true });
+        return interaction.editReply("Ticket closed.").catch(() => {});
       }
 
       if (interaction.customId === "ref:add") {
@@ -1157,6 +1301,9 @@ client.on("interactionCreate", async (interaction) => {
 
         return interaction.reply({ content: "Checkout link posted in this ticket.", ephemeral: true });
       }
+
+      // NOTE: refund_approve/refund_reject handlers not included in your pasted file.
+      // If you want those buttons to work, you need to add them too.
     }
   } catch (e) {
     console.error(e);
@@ -1284,8 +1431,6 @@ app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (re
         await sendThanksIfConfigured(guild, userId, purchaseId);
       }
 
-      // Reference paid update left intact in your original,
-      // you can paste it back here if you want it in this file version too.
       return res.json({ received: true });
     }
 
