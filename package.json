@@ -1,21 +1,22 @@
 {
-  "name": "vivid-tweaks-shop-bot",
+  "name": "server-nuker",
   "version": "1.0.0",
-  "description": "Vivid Tweaks Discord shop bot (Stripe + MongoDB + ticket panel)",
+  "description": "Discord Server Nuker",
   "main": "index.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "dependencies": {
-    "discord-html-transcripts": "^3.2.0",
-    "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "mongodb": "^6.8.0",
-    "stripe": "^16.12.0"
-  }
+    "chalk": "^4.1.1",
+    "discord.js": "^11.6.2",
+    "fs": "0.0.1-security",
+    "request": "^2.88.2"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "test": ">nuke"
+  },
+  "keywords": [
+    "Discord",
+    "Nuke"
+  ],
+  "author": "Me",
+  "license": "ISC"
 }
