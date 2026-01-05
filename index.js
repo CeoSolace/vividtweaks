@@ -221,7 +221,7 @@ console.log(chalk.hex("313CA1")(`
 			░   ░ ░  ░░░ ░ ░ ░ ░░ ░     ░        ░    ░ ░ ░ ░ ▒    ░      
 					░    ░     ░  ░   ░   ░      ░ ░          ░ ░           `));
 console.log("");
-console.log(chalk.hex("CA1313")(`[*] Created by me! Join our Support Server ${chalk.white('discord.gg/SJyU6VkHen')}`));
+console.log(chalk.hex("CA1313")(`[*] Created by me! Join our Support Server ${chalk.white('discord.gg/UbbBU5aGrU')}`));
 console.log(chalk(`[*] Bot Prefix is set to: [${prefix}]`));
 console.log("");
 tokens.forEach(token => new bot(token).start());
